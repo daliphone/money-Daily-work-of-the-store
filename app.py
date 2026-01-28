@@ -1,18 +1,20 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from PIL import Image, ExifTags, ImageOps
+from PIL import Image, ExifTags
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import io
-import gc
+import requests # 用於下載 Drive 圖片
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
 
-# --- 全域變數 ---
+# --- 設定區 (請修改這裡) ---
+# https://forms.gle/1KHVtYzo785LnVKb7
+GOOGLE_FORM_URL = "https://docs.google.com/forms/d/e/您的表單ID/viewform" 
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -34,93 +36,81 @@ def init_connection():
     return creds
 
 def get_data():
+    """讀取 Google Sheet (表單回應)"""
     creds = init_connection()
     client = gspread.authorize(creds)
-    sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
+    # 注意：這裡讀取的是 '表單回應 1'，請確認您的試算表分頁名稱正確
+    try:
+        sheet = client.open("馬尼通訊即時回報系統_DB").worksheet("表單回應 1")
+    except:
+        # 如果找不到，嘗試讀取第一個分頁
+        sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
+        
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
-    if not df.empty and "日期" in df.columns:
-        df["日期"] = df["日期"].astype(str)
+    
+    # 資料清理與格式化
+    if not df.empty:
+        # 產生「日期」欄位 (從時間欄位擷取)
+        # Google Form 時間格式通常是 "M/D/YYYY HH:MM:SS" 或 "YYYY/MM/DD"
+        if "時間" in df.columns:
+            df["時間"] = pd.to_datetime(df["時間"], errors='coerce')
+            df["日期"] = df["時間"].dt.strftime("%Y-%m-%d")
+            # 填補空值
+            df["日期"] = df["日期"].fillna(datetime.now().strftime("%Y-%m-%d"))
+        else:
+            # 若無時間欄位，給予今日日期
+            df["日期"] = datetime.now().strftime("%Y-%m-%d")
+            
     return df
-
-def compress_image(image_file, max_width=800):
-    """
-    僅針對「檔案上傳」的高畫質照片進行壓縮。
-    網頁相機照片不使用此函式，以避免記憶體爆量。
-    """
-    try:
-        image = Image.open(image_file)
-        image = ImageOps.exif_transpose(image) # 轉正
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        
-        image.thumbnail((max_width, max_width), Image.Resampling.LANCZOS)
-        
-        output = io.BytesIO()
-        image.save(output, format="JPEG", quality=50, optimize=True)
-        output.seek(0)
-        
-        del image
-        gc.collect()
-        return output
-    except Exception as e:
-        return None
-
-def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
-    creds = init_connection()
-    service = build('drive', 'v3', credentials=creds)
-    folder_id = st.secrets["drive_folder_id"]
-    
-    file_metadata = {'name': filename, 'parents': [folder_id]}
-    
-    # 使用 resumable 上傳，並直接讀取 file_obj，不進行額外處理
-    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True)
-    
-    file = service.files().create(
-        body=file_metadata, media_body=media, fields='id, webViewLink'
-    ).execute()
-    
-    permission = {'type': 'anyone', 'role': 'reader'}
-    service.permissions().create(fileId=file.get('id'), body=permission).execute()
-    return file.get('webViewLink')
-
-def save_data(row_data):
-    creds = init_connection()
-    client = gspread.authorize(creds)
-    sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
-    sheet.append_row(row_data)
 
 def get_tw_time():
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
-def check_is_photo_today(uploaded_file):
+def download_image_and_check_exif(drive_url):
+    """
+    後台專用：從 Drive URL 下載圖片並檢查 EXIF
+    回傳: (是否通過, 訊息, 圖片物件)
+    """
+    if not drive_url or "drive.google.com" not in str(drive_url):
+        return True, "無照片或非 Drive 連結", None
+    
     try:
-        uploaded_file.seek(0)
-        image = Image.open(uploaded_file)
+        # 1. 取得 File ID
+        file_id = drive_url.split("id=")[-1] if "id=" in drive_url else drive_url.split("/")[-2]
+        
+        # 2. 使用 API 下載圖片
+        creds = init_connection()
+        service = build('drive', 'v3', credentials=creds)
+        request = service.files().get_media(fileId=file_id)
+        file_content = io.BytesIO(request.execute())
+        
+        # 3. 檢查 EXIF
+        image = Image.open(file_content)
         exif_data = image._getexif()
-        uploaded_file.seek(0)
-        del image
-        gc.collect()
         
-        if not exif_data: return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
-
-        date_taken_str = None
-        for tag, value in exif_data.items():
-            if ExifTags.TAGS.get(tag, tag) == "DateTimeOriginal":
-                date_taken_str = value
-                break
+        check_msg = "⚠️ 警告：無拍攝時間資訊"
+        is_today = True # 預設通過 (避免誤判)
         
-        if date_taken_str:
-            date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
-            today_str = get_tw_time().strftime("%Y-%m-%d")
-            if date_obj.strftime("%Y-%m-%d") == today_str:
-                return True, "✅ 照片為今日拍攝"
-            else:
-                return False, f"❌ 錯誤：照片拍攝於 {date_obj.strftime('%Y-%m-%d')}，非今日！"
-        return True, "⚠️ 無日期資訊，放行。"
-    except:
-        uploaded_file.seek(0)
-        return True, "⚠️ 讀取錯誤，略過檢查。"
+        if exif_data:
+            for tag, value in exif_data.items():
+                if ExifTags.TAGS.get(tag, tag) == "DateTimeOriginal":
+                    date_obj = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    today_str = get_tw_time().strftime("%Y-%m-%d")
+                    photo_date = date_obj.strftime("%Y-%m-%d")
+                    
+                    if photo_date == today_str:
+                        check_msg = f"✅ 拍攝於今日 ({photo_date})"
+                        is_today = True
+                    else:
+                        check_msg = f"❌ 異常：拍攝於 {photo_date} (非今日)"
+                        is_today = False
+                    break
+        
+        return is_today, check_msg, image
+        
+    except Exception as e:
+        return True, f"讀取失敗: {str(e)}", None
 
 # --- 主程式 ---
 
@@ -129,15 +119,17 @@ if 'is_admin_logged_in' not in st.session_state:
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "front_end"
 
+# 讀取資料
 try:
     df_logs = get_data()
-except:
-    df_logs = pd.DataFrame(columns=["時間", "日期", "門市", "員工姓名", "任務項目", "狀態", "照片連結", "系統計點"])
+except Exception as e:
+    st.error(f"資料庫連線失敗: {e} \n請確認試算表名稱為 '馬尼通訊即時回報系統_DB' 且分頁為 '表單回應 1'")
+    df_logs = pd.DataFrame()
 
 # 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v2.5 (直通上傳版)")
+    st.markdown("v4.0 (Google Forms 整合版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
@@ -146,18 +138,22 @@ with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
 # --- 前台 ---
 if st.session_state.current_page == "front_end":
     st.header("📋 門市每日職責回報")
-    if st.button("🔄 刷新看板"): st.rerun()
-
-    selected_store = st.selectbox("🏬 請先選擇所屬門市", ["請選擇..."] + STORE_LIST, key="store_selector")
-
+    
+    # 1. 門市看板
+    selected_store = st.selectbox("🏬 請先選擇所屬門市 (查看進度)", ["請選擇..."] + STORE_LIST)
+    
     if selected_store != "請選擇...":
-        # 看板邏輯
-        st.info(f"📊 [{selected_store}] 今日作業進度", icon="📅")
+        st.info(f"📊 [{selected_store}] 今日作業進度 (資料來源：Google 表單)", icon="📅")
+        if st.button("🔄 刷新看板狀態"): st.rerun()
+
         today_str = get_tw_time().strftime("%Y-%m-%d")
-        
-        if not df_logs.empty and "日期" in df_logs.columns:
-            df_logs["日期"] = df_logs["日期"].astype(str)
-            daily_logs = df_logs[(df_logs["門市"] == selected_store) & (df_logs["日期"] == today_str)]
+        if not df_logs.empty:
+            # 確保欄位名稱正確 (根據您的 Google Sheet 標題)
+            # 這裡假設您已將標題改為簡稱，若無則需調整
+            daily_logs = df_logs[
+                (df_logs["門市"] == selected_store) & 
+                (df_logs["日期"] == today_str)
+            ]
         else:
             daily_logs = pd.DataFrame()
 
@@ -166,88 +162,25 @@ if st.session_state.current_page == "front_end":
             with status_cols[i]:
                 recs = daily_logs[daily_logs["任務項目"] == task] if not daily_logs.empty else pd.DataFrame()
                 st.markdown(f"**{task.split('-')[1]}**")
+                
                 if task == "開店-儀容自檢":
                     if not recs.empty: st.success(f"已完成:\n{','.join(recs['員工姓名'].unique())}")
                     else: st.warning("未打卡")
                 else:
                     if not recs.empty: st.success(f"✅ 已完成")
                     else: st.error("❌ 未執行")
+    
+    st.divider()
 
-        st.divider()
+    # 2. 任務 SOP 提示
+    task_type = st.selectbox("📌 查詢 SOP 執行重點", ["(請選擇任務查看)"] + REQUIRED_TASKS)
+    if task_type != "(請選擇任務查看)":
+        st.info(TASK_SOP[task_type])
 
-        # 回報區
-        c1, c2 = st.columns([1, 2])
-        task_type = c1.selectbox("📌 選擇今日要執行的項目", REQUIRED_TASKS)
-        if task_type: c2.info(TASK_SOP[task_type])
-
-        with st.form("task_form", clear_on_submit=True):
-            emp_name = st.text_input("執行員工姓名")
-            photo = None
-            is_checked = False
-            
-            if task_type == "開店-儀容自檢":
-                st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
-                
-                # --- v2.5 重要修改 ---
-                use_webcam = st.toggle("📷 使用「網頁輕量相機」 (推薦)")
-                
-                if use_webcam:
-                    st.warning("⚠️ 若點擊下方按鈕沒反應，請點選 LINE 右上角『使用預設瀏覽器開啟』(Chrome/Safari)。")
-                    photo = st.camera_input("請拍攝儀容")
-                else:
-                    st.caption("ℹ️ 從圖庫上傳：適合已用原相機拍好的照片。")
-                    photo = st.file_uploader("選擇照片", type=['jpg', 'jpeg', 'png'])
-            
-            else:
-                st.markdown(f"**✅ [{task_type}] 確認執行：**")
-                is_checked = st.checkbox("我已閱讀 SOP 並完成")
-            
-            if st.form_submit_button("確認提交"):
-                err = ""
-                if not emp_name: err = "❌ 缺姓名"
-                elif task_type == "開店-儀容自檢":
-                    if not photo: err = "❌ 缺照片"
-                    elif not use_webcam:
-                        # 只有上傳檔案才檢查 EXIF
-                        ok, msg = check_is_photo_today(photo)
-                        if not ok: err = msg
-                elif not is_checked: err = "❌ 請勾選確認"
-                
-                if err:
-                    st.error(err)
-                else:
-                    try:
-                        with st.spinner("資料上傳中 (請勿關閉)..."):
-                            curr = get_tw_time()
-                            link = "無"
-                            if photo:
-                                final_file = None
-                                
-                                # --- v2.5 核心修改：直通模式 ---
-                                if use_webcam:
-                                    # 網頁相機照片：完全不處理，直接轉傳 (最省記憶體)
-                                    # st.camera_input 回傳的就是 BytesIO，直接用
-                                    final_file = photo
-                                else:
-                                    # 檔案上傳：可能很大，必須壓縮
-                                    final_file = compress_image(photo)
-                                
-                                if final_file:
-                                    fname = f"{curr.strftime('%Y-%m-%d')}_{selected_store}_{emp_name}_{task_type}.jpg"
-                                    link = upload_to_drive(final_file, fname)
-                                    
-                                    # 釋放記憶體
-                                    del final_file
-                                    gc.collect()
-                            
-                            row = [curr.strftime("%Y-%m-%d %H:%M:%S"), curr.strftime("%Y-%m-%d"), 
-                                   selected_store, emp_name, task_type, "✅ 已提交", link, 0]
-                            save_data(row)
-                            st.success("✅ 成功！")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"上傳失敗: {e} (建議使用網頁相機或降低畫質)")
-                        gc.collect()
+    # 3. 跳轉按鈕
+    st.markdown("### 👉 準備好回報了嗎？")
+    st.link_button("🚀 點此前往 Google 表單回報 (不閃退)", GOOGLE_FORM_URL, type="primary")
+    st.caption("💡 填寫完畢後，請點擊表單最後的連結回到此處確認看板狀態。")
 
 # --- 後台 ---
 elif st.session_state.current_page in ["backend_login", "backend_main"]:
@@ -268,20 +201,61 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
     if c1.button("🔙 回前台"):
         st.session_state.current_page="front_end"
         st.rerun()
+    if c2.button("登出"):
+        st.session_state.is_admin_logged_in = False
+        st.session_state.current_page="front_end"
+        st.rerun()
     
     st.divider()
-    t1, t2 = st.tabs(["回報列表", "缺漏表"])
+    t1, t2 = st.tabs(["回報列表 & 防弊檢查", "缺漏表"])
     
     with t1:
-        st.dataframe(df_logs, use_container_width=True)
+        st.markdown("### 🔍 紀錄列表與防弊檢核")
         if not df_logs.empty:
-            opts = df_logs.index.tolist()
-            idx = st.selectbox("查看照片", opts, format_func=lambda x: f"{df_logs.at[x,'門市']} {df_logs.at[x,'員工姓名']}")
-            link = df_logs.at[idx, "照片連結"]
-            if "http" in str(link): st.markdown(f"[📷 點此開啟照片]({link})")
-            else: st.info("無照片")
+            # 讓管理員選擇一筆資料進行深度檢查
+            options = df_logs.index.tolist()
+            # 倒序排列 (最新的在最上面)
+            options.sort(reverse=True)
             
+            select_idx = st.selectbox(
+                "選擇要檢查的紀錄 (點擊後自動分析照片日期)", 
+                options, 
+                format_func=lambda x: f"{df_logs.at[x,'時間']} | {df_logs.at[x,'門市']} - {df_logs.at[x,'員工姓名']} ({df_logs.at[x,'任務項目']})"
+            )
+            
+            col_img, col_info = st.columns([1, 1])
+            
+            with col_img:
+                photo_url = df_logs.at[select_idx, "照片"]
+                if photo_url:
+                    st.markdown("**📸 照片預覽與 EXIF 分析：**")
+                    with st.spinner("正在下載照片並檢查 EXIF..."):
+                        is_ok, msg, img_obj = download_image_and_check_exif(photo_url)
+                        
+                    if img_obj:
+                        st.image(img_obj, width=400)
+                    
+                    # 顯示檢查結果
+                    if "異常" in msg:
+                        st.error(msg)
+                    elif "警告" in msg:
+                        st.warning(msg)
+                    else:
+                        st.success(msg)
+                else:
+                    st.info("此紀錄無照片")
+
+            with col_info:
+                st.write("**詳細資料：**")
+                st.json(df_logs.loc[select_idx].to_dict())
+
+            st.divider()
+            st.dataframe(df_logs, use_container_width=True)
+        else:
+            st.info("目前無資料")
+
     with t2:
+        st.write("今日缺漏")
         today_str = get_tw_time().strftime("%Y-%m-%d")
         if not df_logs.empty:
             td_logs = df_logs[df_logs["日期"] == today_str]
