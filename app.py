@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from PIL import Image, ExifTags  # 用於檢查照片時間
+from PIL import Image, ExifTags
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
@@ -24,21 +24,19 @@ STORE_LIST = [
 
 # --- 輔助函式：檢查照片 EXIF 時間 ---
 def check_is_photo_today(uploaded_file):
-    """
-    讀取照片 EXIF，檢查是否為今日拍攝。
-    回傳值: (布林值, 訊息)
-    """
     try:
+        # 重點修正：先將指標歸零，以免讀取失敗
+        uploaded_file.seek(0)
         image = Image.open(uploaded_file)
-        # 取得 EXIF 資料
         exif_data = image._getexif()
         
+        # 讀取完畢後，務必將指標再次歸零，讓後續程式能存檔
+        uploaded_file.seek(0)
+        
         if not exif_data:
-            # 如果照片沒有 EXIF (例如被 LINE 壓縮過或截圖)，我們無法判斷時間
-            # 策略：顯示警告但放行 (避免誤殺)，或是嚴格禁止
-            return True, "⚠️ 警告：無法讀取拍攝時間 (可能是截圖或後製)，請盡量使用原相機直拍。"
+            return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
 
-        # 尋找 "DateTimeOriginal" (Tag ID: 36867)
+        # Tag 36867 = DateTimeOriginal
         date_taken_str = None
         for tag, value in exif_data.items():
             decoded = ExifTags.TAGS.get(tag, tag)
@@ -47,26 +45,44 @@ def check_is_photo_today(uploaded_file):
                 break
         
         if date_taken_str:
-            # 格式通常為 "YYYY:MM:DD HH:MM:SS"
-            date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            photo_date_str = date_obj.strftime("%Y-%m-%d")
-            
-            if photo_date_str == today_str:
-                return True, "✅ 照片為今日拍攝"
-            else:
-                return False, f"❌ 錯誤：這張照片是 {photo_date_str} 拍的，非今日照片！"
+            # EXIF 時間格式通常為 "YYYY:MM:DD HH:MM:SS"
+            try:
+                date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                photo_date_str = date_obj.strftime("%Y-%m-%d")
+                
+                if photo_date_str == today_str:
+                    return True, "✅ 照片為今日拍攝"
+                else:
+                    return False, f"❌ 錯誤：照片拍攝於 {photo_date_str}，非今日！"
+            except ValueError:
+                return True, "⚠️ 日期格式解析失敗，放行。"
         else:
-            return True, "⚠️ 警告：照片無日期資訊，本次放行。"
+            return True, "⚠️ 照片無日期資訊，放行。"
             
     except Exception as e:
+        # 發生錯誤也記得歸零
+        uploaded_file.seek(0)
         return True, f"⚠️ 讀取錯誤，略過檢查: {e}"
 
-# --- 2. 後端數據初始化 ---
+# --- 2. 後端數據初始化 (含自動修復) ---
 if 'mani_live_logs' not in st.session_state:
     st.session_state.mani_live_logs = pd.DataFrame(columns=[
         "時間", "門市", "員工姓名", "任務項目", "狀態", "照片物件", "系統計點", "日期"
     ])
+
+# 自動修復機制：防止舊版 DataFrame 缺少欄位導致後台崩潰
+expected_columns = ["時間", "門市", "員工姓名", "任務項目", "狀態", "照片物件", "系統計點", "日期"]
+current_columns = st.session_state.mani_live_logs.columns.tolist()
+missing_columns = [col for col in expected_columns if col not in current_columns]
+
+if missing_columns:
+    # 如果發現缺欄位，自動補上
+    for col in missing_columns:
+        st.session_state.mani_live_logs[col] = None
+    # 填補日期欄位 (若舊資料無日期，用時間推算)
+    if "日期" in missing_columns and not st.session_state.mani_live_logs.empty:
+        st.session_state.mani_live_logs["日期"] = pd.to_datetime(st.session_state.mani_live_logs["時間"]).dt.strftime("%Y-%m-%d")
 
 if 'is_admin_logged_in' not in st.session_state:
     st.session_state.is_admin_logged_in = False
@@ -76,11 +92,16 @@ st.sidebar.title("馬尼通訊管理系統")
 
 with st.sidebar.expander("ℹ️ 系統資訊與版本紀錄", expanded=False):
     st.markdown("""
-    **版本資訊：v1.4.1 (穩定防弊版)**
+    **版本資訊：v1.4.2 (修復顯示版)**
     - **2026/01/30 更新：**
-      1. 優化：將相機改回「檔案上傳」模式，解決 LINE/IG 瀏覽器黑屏問題。
-      2. 防弊：新增照片 EXIF 時間檢查，若上傳舊照片會顯示錯誤。
+      1. 修復：管理後台無數據問題 (增加資料結構自動校正)。
+      2. 修復：照片上傳後的檔案讀取問題 (Reset Seek)。
     """)
+    # 緊急重置按鈕 (若資料真的壞掉可用)
+    if st.button("⚠️ 清除所有資料 (重置系統)"):
+        st.session_state.clear()
+        st.rerun()
+        
     st.divider()
     is_admin_mode = st.toggle("開啟管理後台模式")
 
@@ -98,7 +119,11 @@ if not is_admin_mode:
         st.info(f"📊 [{selected_store}] 今日作業進度看板", icon="📅")
         today_str = datetime.now().strftime("%Y-%m-%d")
         
-        if not st.session_state.mani_live_logs.empty:
+        # 確保資料表不為空且有日期欄位
+        if not st.session_state.mani_live_logs.empty and "日期" in st.session_state.mani_live_logs.columns:
+            # 處理 NaN 日期 (避免舊資料報錯)
+            st.session_state.mani_live_logs["日期"] = st.session_state.mani_live_logs["日期"].fillna(today_str)
+            
             daily_logs = st.session_state.mani_live_logs[
                 (st.session_state.mani_live_logs["門市"] == selected_store) & 
                 (st.session_state.mani_live_logs["日期"] == today_str)
@@ -144,15 +169,10 @@ if not is_admin_mode:
             photo = None
             is_checked = False
             
-            # 儀容自檢
             if task_type == "開店-儀容自檢":
                 st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
                 st.caption("💡 提示：點擊下方按鈕後，請選擇「相機」進行拍攝。")
-                
-                # 修改：改回 file_uploader 以確保所有手機都能用
                 photo = st.file_uploader("點擊開啟相機 (勿上傳舊照)", type=['jpg', 'jpeg', 'png'], key="uploader")
-            
-            # 其他項目
             else:
                 st.markdown(f"**✅ [{task_type}] 確認執行：**")
                 is_done_today = False
@@ -162,14 +182,12 @@ if not is_admin_mode:
                 
                 if is_done_today:
                     st.warning(f"⚠️ 注意：此項目今日已有同仁回報過。")
-                
                 is_checked = st.checkbox(f"我已閱讀 SOP 並完成 [{task_type}]", key="check_exec")
             
             submit = st.form_submit_button("確認提交", use_container_width=True)
             
             if submit:
                 error_msg = ""
-                # EXIF 檢查結果變數
                 pass_exif = True
                 exif_msg = ""
 
@@ -179,12 +197,11 @@ if not is_admin_mode:
                     if not photo:
                         error_msg = "❌ 錯誤：儀容自檢必須上傳照片！"
                     else:
-                        # 執行 EXIF 時間檢查
                         pass_exif, exif_msg = check_is_photo_today(photo)
                         if not pass_exif:
-                            error_msg = exif_msg # 阻擋提交
+                            error_msg = exif_msg
                         elif "警告" in exif_msg:
-                            st.warning(exif_msg) # 僅警告但放行
+                            st.warning(exif_msg)
 
                 elif task_type != "開店-儀容自檢" and not is_checked:
                     error_msg = "❌ 錯誤：請勾選確認已執行！"
@@ -232,7 +249,12 @@ else:
 
     with tab1:
         st.subheader("📢 回報列表")
-        display_df = st.session_state.mani_live_logs.drop(columns=["照片物件"])
+        # 重點修正：使用 errors='ignore' 防止因為欄位不存在而崩潰
+        if "照片物件" in st.session_state.mani_live_logs.columns:
+            display_df = st.session_state.mani_live_logs.drop(columns=["照片物件"])
+        else:
+            display_df = st.session_state.mani_live_logs
+            
         st.dataframe(display_df.sort_values(by="時間", ascending=False), use_container_width=True)
         
         st.divider()
@@ -246,11 +268,22 @@ else:
                     format_func=lambda x: f"{st.session_state.mani_live_logs.at[x, '門市']} - {st.session_state.mani_live_logs.at[x, '員工姓名']} - {st.session_state.mani_live_logs.at[x, '任務項目']}",
                     key="audit_select"
                 )
-                photo_obj = st.session_state.mani_live_logs.at[row_to_audit, "照片物件"]
+                
+                # 再次確認欄位存在才讀取
+                if "照片物件" in st.session_state.mani_live_logs.columns:
+                    photo_obj = st.session_state.mani_live_logs.at[row_to_audit, "照片物件"]
+                else:
+                    photo_obj = None
+                    
                 task_name = st.session_state.mani_live_logs.at[row_to_audit, "任務項目"]
                 
                 if photo_obj:
-                    st.image(photo_obj, caption="員工上傳之回報照片", width=300)
+                    # 嘗試將指標歸零，以確保能顯示
+                    try:
+                        photo_obj.seek(0)
+                        st.image(photo_obj, caption="員工上傳之回報照片", width=300)
+                    except:
+                        st.error("照片讀取失敗 (可能已過期或損毀)")
                 elif "儀容自檢" in task_name:
                     st.error("異常：應有照片但未找到")
                 else:
@@ -278,7 +311,14 @@ else:
             st.warning("尚無數據。")
         else:
             report_status = []
-            today_logs = st.session_state.mani_live_logs[st.session_state.mani_live_logs["日期"] == today_str]
+            # 確保有日期欄位
+            if "日期" in st.session_state.mani_live_logs.columns:
+                df_clean = st.session_state.mani_live_logs.copy()
+                df_clean["日期"] = df_clean["日期"].fillna(today_str)
+                today_logs = df_clean[df_clean["日期"] == today_str]
+            else:
+                today_logs = pd.DataFrame()
+                
             for store in STORE_LIST:
                 store_logs = today_logs[today_logs["門市"] == store]
                 completed = store_logs["任務項目"].unique().tolist()
