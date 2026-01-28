@@ -13,7 +13,7 @@ st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
 
 # --- 設定區 (請修改這裡) ---
 # https://forms.gle/1KHVtYzo785LnVKb7
-GOOGLE_FORM_URL = "https://docs.google.com/forms/d/e/您的表單ID/viewform" 
+GOOGLE_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSdbn7iEdjmDcvpeD6WbYnxuuZVv79DiLXsA5SGtDFuWoG00PQ/viewform/viewform" 
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -266,3 +266,4 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
                 miss = [t for t in REQUIRED_TASKS if t!="開店-儀容自檢" and t not in comp]
                 res.append({"門市":s, "未完成": ",".join(miss) if miss else "✅ Done"})
             st.dataframe(pd.DataFrame(res), use_container_width=True)
+
