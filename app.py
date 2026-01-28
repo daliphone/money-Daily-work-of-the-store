@@ -6,7 +6,6 @@ from datetime import datetime
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
 
 # --- 設定全域變數 (任務清單與 SOP 內容) ---
-# 這裡定義每個任務對應的詳細說明，會即時顯示給員工看
 TASK_SOP = {
     "開店-儀容自檢": "📋 執行重點：請確認穿著制服、配戴名牌，頭髮梳理整齊，保持專業儀態。",
     "開店-環境清掃": "🧹 執行重點：櫃台桌面擦拭、店內地面掃拖、玻璃門清潔、垃圾桶清理。",
@@ -15,7 +14,6 @@ TASK_SOP = {
     "閉店-庫存表上傳": "📊 執行重點：執行日結作業，產出今日庫存報表，確認帳實相符後上傳。"
 }
 
-# 取得任務清單 (從字典的 keys 抓取)
 REQUIRED_TASKS = list(TASK_SOP.keys())
 
 STORE_LIST = [
@@ -35,19 +33,15 @@ if 'is_admin_logged_in' not in st.session_state:
 # --- 3. 側邊欄：系統資訊與導航 ---
 st.sidebar.title("馬尼通訊管理系統")
 
-# 需求3: 預設在閉合狀態 (expanded=False)
+# 需求3: 維持預設閉合狀態
 with st.sidebar.expander("ℹ️ 系統資訊與版本紀錄", expanded=False):
     st.markdown("""
-    **版本資訊：v1.3.1**
+    **版本資訊：v1.3.2**
     - **2026/01/29 更新：**
-      1. 優化：選擇任務時即時顯示 SOP 內容。
-      2. 修正：系統資訊預設為閉合狀態。
-    - **2026/01/28 更新：**
-      1. 流程分流：僅儀容自檢需拍照。
-      2. 新增後台：每月統計報表。
+      1. 修復 UX：將任務選擇移出表單，實現即時 SOP 顯示與欄位切換。
+      2. 介面優化：操作流程改為「先選任務 -> 閱讀 SOP -> 填寫資料」。
     """)
     st.divider()
-    # 管理後台開關藏在這裡
     is_admin_mode = st.toggle("開啟管理後台模式")
 
 # --- 4. 邏輯分流 ---
@@ -55,40 +49,44 @@ with st.sidebar.expander("ℹ️ 系統資訊與版本紀錄", expanded=False):
 # === 模式 A: 門市同仁回報端 ===
 if not is_admin_mode:
     st.header("📋 門市每日職責回報")
+
+    # --- 關鍵修改：將「任務選擇」移出 Form 之外，實現即時互動 ---
+    col_task_select, col_sop = st.columns([1, 2])
     
+    with col_task_select:
+        # 1. 先選擇要做什麼 (因為在 Form 外，這裡一選就會馬上刷新頁面)
+        task_type = st.selectbox("📌 第一步：請選擇回報項目", REQUIRED_TASKS, key="outer_task_selector")
+    
+    with col_sop:
+        # 2. 這裡會立刻顯示對應的 SOP
+        if task_type:
+            st.info(TASK_SOP[task_type], icon="ℹ️")
+
+    st.divider()
+
+    # --- 表單區塊 (資料填寫與提交) ---
+    st.caption("👇 第二步：填寫回報資訊")
     with st.form("task_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
             selected_store = st.selectbox("所屬門市 (必選)", ["請選擇..."] + STORE_LIST, key="input_store")
-            emp_name = st.text_input("員工姓名", key="input_emp_name")
         
         with col2:
-            # 任務選擇
-            task_type = st.selectbox("回報項目", REQUIRED_TASKS, key="input_task")
-            
-            # 需求2: 及時顯示該回報項目內容 (SOP)
-            # 使用 info 框框顯示對應的 SOP 文字
-            if task_type:
-                st.info(TASK_SOP[task_type], icon="ℹ️")
+            emp_name = st.text_input("員工姓名", key="input_emp_name")
         
-        st.divider()
-        
-        # --- 動態顯示邏輯 ---
+        # --- 動態顯示邏輯 (根據外面選的 task_type 改變) ---
         photo = None
         is_checked = False
         
-        # 需求1: 只有「開店-儀容自檢」顯示拍照
+        # 顯示對應的輸入框
         if task_type == "開店-儀容自檢":
-            st.markdown("#### 📸 拍照存證")
-            st.caption("此項目規定必須 **拍照回報**。")
-            photo = st.file_uploader("請上傳儀容自拍 (必填)", type=['jpg', 'png', 'jpeg'], key="uploader")
-        
-        # 其餘項目顯示勾選
+            st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
+            photo = st.file_uploader("點擊上傳照片 (必填)", type=['jpg', 'png', 'jpeg'], key="uploader")
         else:
-            st.markdown(f"#### ✅ 確認執行")
-            st.caption(f"請確認您已完成上述「{task_type}」之工作內容。")
-            is_checked = st.checkbox(f"我確認已完成 [{task_type}]", key="check_exec")
+            st.markdown(f"**✅ [{task_type}] 確認執行：**")
+            is_checked = st.checkbox(f"我已閱讀上述 SOP 並完成 [{task_type}] 工作", key="check_exec")
             
+        # 提交按鈕
         submit = st.form_submit_button("確認提交", use_container_width=True)
         
         if submit:
@@ -129,7 +127,6 @@ if not is_admin_mode:
 else:
     st.header("🔐 管理後台")
 
-    # 密碼驗證
     if not st.session_state.is_admin_logged_in:
         password = st.text_input("請輸入管理員密碼", type="password", key="admin_pass")
         if st.button("登入"):
