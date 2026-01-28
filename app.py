@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from PIL import Image, ExifTags  # 用於檢查照片時間
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
 
-# --- 設定全域變數 (任務清單與 SOP) ---
+# --- 設定全域變數 ---
 TASK_SOP = {
     "開店-儀容自檢": "📋 執行重點：全體員工皆需執行。確認穿著制服、配戴名牌，頭髮梳理整齊。",
     "開店-環境清掃": "🧹 執行重點：門市公用事項。櫃台桌面擦拭、店內地面掃拖、玻璃門清潔。",
@@ -21,12 +22,51 @@ STORE_LIST = [
     "歸仁店", "安中店", "鹽行店", "五甲店"
 ]
 
+# --- 輔助函式：檢查照片 EXIF 時間 ---
+def check_is_photo_today(uploaded_file):
+    """
+    讀取照片 EXIF，檢查是否為今日拍攝。
+    回傳值: (布林值, 訊息)
+    """
+    try:
+        image = Image.open(uploaded_file)
+        # 取得 EXIF 資料
+        exif_data = image._getexif()
+        
+        if not exif_data:
+            # 如果照片沒有 EXIF (例如被 LINE 壓縮過或截圖)，我們無法判斷時間
+            # 策略：顯示警告但放行 (避免誤殺)，或是嚴格禁止
+            return True, "⚠️ 警告：無法讀取拍攝時間 (可能是截圖或後製)，請盡量使用原相機直拍。"
+
+        # 尋找 "DateTimeOriginal" (Tag ID: 36867)
+        date_taken_str = None
+        for tag, value in exif_data.items():
+            decoded = ExifTags.TAGS.get(tag, tag)
+            if decoded == "DateTimeOriginal":
+                date_taken_str = value
+                break
+        
+        if date_taken_str:
+            # 格式通常為 "YYYY:MM:DD HH:MM:SS"
+            date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            photo_date_str = date_obj.strftime("%Y-%m-%d")
+            
+            if photo_date_str == today_str:
+                return True, "✅ 照片為今日拍攝"
+            else:
+                return False, f"❌ 錯誤：這張照片是 {photo_date_str} 拍的，非今日照片！"
+        else:
+            return True, "⚠️ 警告：照片無日期資訊，本次放行。"
+            
+    except Exception as e:
+        return True, f"⚠️ 讀取錯誤，略過檢查: {e}"
+
 # --- 2. 後端數據初始化 ---
 if 'mani_live_logs' not in st.session_state:
     st.session_state.mani_live_logs = pd.DataFrame(columns=[
         "時間", "門市", "員工姓名", "任務項目", "狀態", "照片物件", "系統計點", "日期"
     ])
-    # 新增 "日期" 欄位以便篩選當日狀態
 
 if 'is_admin_logged_in' not in st.session_state:
     st.session_state.is_admin_logged_in = False
@@ -36,11 +76,10 @@ st.sidebar.title("馬尼通訊管理系統")
 
 with st.sidebar.expander("ℹ️ 系統資訊與版本紀錄", expanded=False):
     st.markdown("""
-    **版本資訊：v1.4.0**
+    **版本資訊：v1.4.1 (穩定防弊版)**
     - **2026/01/30 更新：**
-      1. 新增「門市今日任務看板」：可即時查看該店今日完成進度。
-      2. 儀容自檢：列出已完成員工姓名，並強制使用相機拍攝 (不可選圖)。
-      3. 其他項目：以門市為單位，顯示是否已完成。
+      1. 優化：將相機改回「檔案上傳」模式，解決 LINE/IG 瀏覽器黑屏問題。
+      2. 防弊：新增照片 EXIF 時間檢查，若上傳舊照片會顯示錯誤。
     """)
     st.divider()
     is_admin_mode = st.toggle("開啟管理後台模式")
@@ -51,19 +90,14 @@ with st.sidebar.expander("ℹ️ 系統資訊與版本紀錄", expanded=False):
 if not is_admin_mode:
     st.header("📋 門市每日職責回報")
 
-    # 步驟 1: 先選擇門市 (這決定了下方要顯示什麼看板)
     selected_store = st.selectbox("🏬 請先選擇所屬門市", ["請選擇..."] + STORE_LIST, key="store_selector")
 
-    # 只有選了門市才顯示看板與後續操作
     if selected_store != "請選擇...":
         
-        # --- 🚀 功能：門市今日任務看板 (Dashboard) ---
+        # --- 看板區塊 ---
         st.info(f"📊 [{selected_store}] 今日作業進度看板", icon="📅")
-        
-        # 取得今日日期字串
         today_str = datetime.now().strftime("%Y-%m-%d")
         
-        # 篩選出「這間店」+「今天」的所有紀錄
         if not st.session_state.mani_live_logs.empty:
             daily_logs = st.session_state.mani_live_logs[
                 (st.session_state.mani_live_logs["門市"] == selected_store) & 
@@ -72,28 +106,20 @@ if not is_admin_mode:
         else:
             daily_logs = pd.DataFrame()
 
-        # 顯示各項任務狀態
         status_cols = st.columns(len(REQUIRED_TASKS))
-        
         for i, task in enumerate(REQUIRED_TASKS):
             with status_cols[i]:
-                # 找出這個任務今天的紀錄
                 task_records = daily_logs[daily_logs["任務項目"] == task] if not daily_logs.empty else pd.DataFrame()
-                
-                # 標題
-                clean_name = task.split("-")[1] # 只顯示 "-" 後面的簡稱
+                clean_name = task.split("-")[1]
                 st.markdown(f"**{clean_name}**")
                 
-                # 邏輯分流顯示
                 if task == "開店-儀容自檢":
-                    # 儀容自檢：顯示已完成的人名
                     if not task_records.empty:
                         names = task_records["員工姓名"].unique().tolist()
                         st.success(f"已完成：\n{', '.join(names)}")
                     else:
                         st.warning("尚無人打卡")
                 else:
-                    # 其他項目：顯示完成與否
                     if not task_records.empty:
                         doer = task_records.iloc[0]["員工姓名"]
                         st.success(f"✅ 已完成\n({doer})")
@@ -102,7 +128,7 @@ if not is_admin_mode:
 
         st.divider()
 
-        # --- 步驟 2: 選擇要執行的任務 ---
+        # --- 回報操作區 ---
         col_task_select, col_sop = st.columns([1, 2])
         with col_task_select:
             task_type = st.selectbox("📌 選擇今日要執行的項目", REQUIRED_TASKS, key="task_selector")
@@ -111,25 +137,24 @@ if not is_admin_mode:
             if task_type:
                 st.info(TASK_SOP[task_type], icon="ℹ️")
 
-        # --- 步驟 3: 填寫資料與提交 ---
         st.caption("👇 執行回報區")
         with st.form("task_form", clear_on_submit=True):
             emp_name = st.text_input("執行員工姓名", key="input_emp_name")
             
-            # 動態顯示邏輯
             photo = None
             is_checked = False
             
-            # 情境 A: 儀容自檢 (強制相機)
+            # 儀容自檢
             if task_type == "開店-儀容自檢":
                 st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
-                # 需求3: 僅選擇相機，不可選擇圖片上傳 -> 使用 st.camera_input
-                photo = st.camera_input("請拍攝當下儀容 (無法選圖)", key="camera")
+                st.caption("💡 提示：點擊下方按鈕後，請選擇「相機」進行拍攝。")
+                
+                # 修改：改回 file_uploader 以確保所有手機都能用
+                photo = st.file_uploader("點擊開啟相機 (勿上傳舊照)", type=['jpg', 'jpeg', 'png'], key="uploader")
             
-            # 情境 B: 其他項目 (勾選確認)
+            # 其他項目
             else:
                 st.markdown(f"**✅ [{task_type}] 確認執行：**")
-                # 檢查是否已經有人做過 (提示用，不強制阻擋，因為可能有補做需求)
                 is_done_today = False
                 if not daily_logs.empty:
                      if task_type in daily_logs["任務項目"].values:
@@ -140,15 +165,27 @@ if not is_admin_mode:
                 
                 is_checked = st.checkbox(f"我已閱讀 SOP 並完成 [{task_type}]", key="check_exec")
             
-            # 提交按鈕
             submit = st.form_submit_button("確認提交", use_container_width=True)
             
             if submit:
                 error_msg = ""
+                # EXIF 檢查結果變數
+                pass_exif = True
+                exif_msg = ""
+
                 if not emp_name:
                     error_msg = "❌ 錯誤：請輸入員工姓名！"
-                elif task_type == "開店-儀容自檢" and not photo:
-                    error_msg = "❌ 錯誤：儀容自檢必須拍攝照片！"
+                elif task_type == "開店-儀容自檢":
+                    if not photo:
+                        error_msg = "❌ 錯誤：儀容自檢必須上傳照片！"
+                    else:
+                        # 執行 EXIF 時間檢查
+                        pass_exif, exif_msg = check_is_photo_today(photo)
+                        if not pass_exif:
+                            error_msg = exif_msg # 阻擋提交
+                        elif "警告" in exif_msg:
+                            st.warning(exif_msg) # 僅警告但放行
+
                 elif task_type != "開店-儀容自檢" and not is_checked:
                     error_msg = "❌ 錯誤：請勾選確認已執行！"
                 
@@ -156,12 +193,9 @@ if not is_admin_mode:
                     st.error(error_msg)
                 else:
                     now = datetime.now()
-                    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-                    date_str = now.strftime("%Y-%m-%d")
-                    
                     new_data = {
-                        "時間": now_str, 
-                        "日期": date_str,
+                        "時間": now.strftime("%Y-%m-%d %H:%M:%S"), 
+                        "日期": now.strftime("%Y-%m-%d"),
                         "門市": selected_store, 
                         "員工姓名": emp_name,
                         "任務項目": task_type, 
@@ -174,7 +208,7 @@ if not is_admin_mode:
                         ignore_index=True
                     )
                     st.success(f"提交成功！")
-                    st.rerun() # 重新整理頁面以更新上方的看板狀態
+                    st.rerun()
 
 # === 模式 B: 管理後台 ===
 else:
@@ -194,7 +228,6 @@ else:
         st.session_state.is_admin_logged_in = False
         st.rerun()
     
-    # --- 後台分頁 ---
     tab1, tab2, tab3 = st.tabs(["📊 即時監控", "⚠️ 缺漏檢核", "📈 統計報表"])
 
     with tab1:
@@ -217,8 +250,7 @@ else:
                 task_name = st.session_state.mani_live_logs.at[row_to_audit, "任務項目"]
                 
                 if photo_obj:
-                    # 這裡 st.camera_input 產生的也是 file-like object，可以直接顯示
-                    st.image(photo_obj, caption="現場拍攝照片", width=300)
+                    st.image(photo_obj, caption="員工上傳之回報照片", width=300)
                 elif "儀容自檢" in task_name:
                     st.error("異常：應有照片但未找到")
                 else:
@@ -240,25 +272,18 @@ else:
                     st.rerun()
 
     with tab2:
-        st.subheader("⚠️ 每日缺漏檢核 (依門市)")
-        # 這裡邏輯微調：儀容自檢很難算缺漏(不知道今天幾人上班)，主要算公用任務
+        st.subheader("⚠️ 每日缺漏檢核")
         today_str = datetime.now().strftime("%Y-%m-%d")
-        
         if st.session_state.mani_live_logs.empty:
             st.warning("尚無數據。")
         else:
             report_status = []
-            # 只檢查當天
             today_logs = st.session_state.mani_live_logs[st.session_state.mani_live_logs["日期"] == today_str]
-            
             for store in STORE_LIST:
                 store_logs = today_logs[today_logs["門市"] == store]
                 completed = store_logs["任務項目"].unique().tolist()
-                
-                # 排除儀容自檢(因為是個人的)，只檢查公用任務是否缺漏
                 store_tasks = [t for t in REQUIRED_TASKS if t != "開店-儀容自檢"]
                 missing = [t for t in store_tasks if t not in completed]
-                
                 report_status.append({
                     "門市": store, 
                     "公用任務未完成數": len(missing), 
