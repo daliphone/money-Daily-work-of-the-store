@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from PIL import Image, ExifTags, ImageOps # 新增 ImageOps 用於轉正照片
+from PIL import Image, ExifTags, ImageOps
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-import io # 新增 io 用於處理記憶體中的壓縮圖
+import io
+import gc # 新增：記憶體回收機制
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
@@ -46,58 +47,53 @@ def get_data():
 
 def compress_image(image_file):
     """
-    功能：壓縮圖片並修正旋轉問題
-    輸入：原始上傳檔案
-    輸出：壓縮後的 BytesIO 物件 (可用於上傳)
+    極致優化版：壓縮圖片以防止記憶體溢出
     """
-    image = Image.open(image_file)
-    
-    # 1. 修正手機照片旋轉問題 (EXIF Transpose)
-    image = ImageOps.exif_transpose(image)
-    
-    # 2. 調整尺寸 (若寬度大於 1024px 則等比縮小)
-    max_width = 1024
-    if image.width > max_width:
-        ratio = max_width / image.width
-        new_height = int(image.height * ratio)
-        image = image.resize((max_width, new_height))
-    
-    # 3. 轉換為 RGB (避免 PNG 透明度造成存檔錯誤)
-    if image.mode in ("RGBA", "P"):
-        image = image.convert("RGB")
+    try:
+        image = Image.open(image_file)
         
-    # 4. 壓縮存入記憶體
-    output = io.BytesIO()
-    # quality=60 可大幅減少檔案大小但肉眼幾乎看不出差異
-    image.save(output, format="JPEG", quality=60, optimize=True)
-    output.seek(0) # 指標歸零
-    return output
+        # 1. 修正旋轉 (手機照片常見問題)
+        image = ImageOps.exif_transpose(image)
+        
+        # 2. 轉換為 RGB (丟棄透明通道以節省空間)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+            
+        # 3. 使用 thumbnail 進行縮圖 (比 resize 更省記憶體)
+        # 將最大寬度限制在 800px (足夠辨識儀容)
+        image.thumbnail((800, 800), Image.Resampling.LANCZOS)
+        
+        # 4. 壓縮存入 Buffer
+        output = io.BytesIO()
+        # quality=50 是可接受的最低畫質，能極大化壓縮比
+        image.save(output, format="JPEG", quality=50, optimize=True)
+        output.seek(0)
+        
+        # 5. 強制釋放原始圖片記憶體
+        del image
+        gc.collect() 
+        
+        return output
+    except Exception as e:
+        st.error(f"圖片處理失敗 (記憶體不足): {e}")
+        return None
 
 def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
-    """上傳到 Google Drive"""
     creds = init_connection()
     service = build('drive', 'v3', credentials=creds)
     folder_id = st.secrets["drive_folder_id"]
     
-    file_metadata = {
-        'name': filename,
-        'parents': [folder_id]
-    }
+    file_metadata = {'name': filename, 'parents': [folder_id]}
     
-    # 使用 resumable=True 對大檔案較穩定，這裡我們上傳壓縮後的流
-    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True)
+    # Chunk size 設定為 5MB，避免一次佔用太多
+    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True, chunksize=5*1024*1024)
     
     file = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id, webViewLink'
+        body=file_metadata, media_body=media, fields='id, webViewLink'
     ).execute()
     
     permission = {'type': 'anyone', 'role': 'reader'}
-    service.permissions().create(
-        fileId=file.get('id'),
-        body=permission
-    ).execute()
+    service.permissions().create(fileId=file.get('id'), body=permission).execute()
     
     return file.get('webViewLink')
 
@@ -110,14 +106,18 @@ def save_data(row_data):
 def get_tw_time():
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
-# --- EXIF 檢查 (輕量化版) ---
+# --- EXIF 檢查 ---
 def check_is_photo_today(uploaded_file):
     try:
         uploaded_file.seek(0)
-        # 這裡只讀取 Header，不載入整張圖，節省記憶體
+        # 僅讀取 Header，不載入圖片數據
         image = Image.open(uploaded_file)
         exif_data = image._getexif()
-        uploaded_file.seek(0) # 檢查完畢務必歸零
+        uploaded_file.seek(0)
+        
+        # 立即釋放 Image 物件
+        del image
+        gc.collect()
         
         if not exif_data:
             return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
@@ -156,13 +156,13 @@ if 'current_page' not in st.session_state:
 try:
     df_logs = get_data()
 except Exception as e:
-    st.error(f"❌ 無法連線至資料庫。\n錯誤訊息: {e}")
+    # 這裡只顯示簡單錯誤，避免嚇到使用者
     df_logs = pd.DataFrame(columns=["時間", "日期", "門市", "員工姓名", "任務項目", "狀態", "照片連結", "系統計點"])
 
 # 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v2.2 (圖片壓縮優化版)")
+    st.markdown("v2.3 (極致省記憶體版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
@@ -229,6 +229,7 @@ if st.session_state.current_page == "front_end":
             
             if task_type == "開店-儀容自檢":
                 st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
+                st.caption("⚠️ 注意：若照片過大可能導致系統重啟，建議使用普通畫質拍攝。")
                 photo = st.file_uploader("點擊開啟相機", type=['jpg', 'jpeg', 'png'])
             else:
                 st.markdown(f"**✅ [{task_type}] 確認執行：**")
@@ -245,7 +246,6 @@ if st.session_state.current_page == "front_end":
                     if not photo:
                         error_msg = "❌ 必須上傳照片！"
                     else:
-                        # 1. 先檢查 EXIF (使用原始檔)
                         pass_exif, exif_msg = check_is_photo_today(photo)
                         if not pass_exif: error_msg = exif_msg
 
@@ -255,21 +255,26 @@ if st.session_state.current_page == "front_end":
                 if error_msg:
                     st.error(error_msg)
                 else:
-                    with st.spinner("影像壓縮與上傳中..."):
+                    status_placeholder = st.empty()
+                    status_placeholder.info("⏳ 正在處理影像 (請勿關閉)...")
+                    
+                    try:
                         current_tw = get_tw_time()
                         time_str = current_tw.strftime("%Y-%m-%d %H:%M:%S")
                         date_str = current_tw.strftime("%Y-%m-%d")
                         
                         photo_link = "無"
                         if photo:
-                            try:
-                                # 2. 進行壓縮 (關鍵步驟)
-                                compressed_image = compress_image(photo)
+                            # 進行極致壓縮
+                            compressed_image = compress_image(photo)
+                            if compressed_image:
                                 file_name = f"{date_str}_{selected_store}_{emp_name}_{task_type}.jpg"
-                                # 3. 上傳壓縮後的檔案
                                 photo_link = upload_to_drive(compressed_image, file_name)
-                            except Exception as e:
-                                st.error(f"圖片處理失敗，可能是記憶體不足或檔案毀損: {e}")
+                                # 再次手動釋放記憶體
+                                del compressed_image
+                                gc.collect()
+                            else:
+                                st.error("❌ 圖片處理失敗 (檔案可能過大)，請重試。")
                                 st.stop()
                         
                         row = [
@@ -278,8 +283,14 @@ if st.session_state.current_page == "front_end":
                         ]
                         
                         save_data(row)
-                        st.success("✅ 提交成功！")
+                        status_placeholder.success("✅ 提交成功！")
+                        # 強制釋放所有未使用的記憶體
+                        gc.collect()
                         st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"系統錯誤: {e}")
+                        gc.collect() # 發生錯誤也要清理記憶體
 
 # B. 後台
 elif st.session_state.current_page in ["backend_login", "backend_main"]:
