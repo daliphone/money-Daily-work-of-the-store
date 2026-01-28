@@ -44,18 +44,19 @@ def get_data():
     return df
 
 def compress_image(image_file, max_width=800):
-    """記憶體友善的壓縮函式"""
+    """
+    僅針對「檔案上傳」的高畫質照片進行壓縮。
+    網頁相機照片不使用此函式，以避免記憶體爆量。
+    """
     try:
         image = Image.open(image_file)
         image = ImageOps.exif_transpose(image) # 轉正
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # 使用 thumbnail 原地縮圖，極大節省記憶體
         image.thumbnail((max_width, max_width), Image.Resampling.LANCZOS)
         
         output = io.BytesIO()
-        # 畫質降至 50 以確保上傳順暢
         image.save(output, format="JPEG", quality=50, optimize=True)
         output.seek(0)
         
@@ -71,7 +72,9 @@ def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
     folder_id = st.secrets["drive_folder_id"]
     
     file_metadata = {'name': filename, 'parents': [folder_id]}
-    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True, chunksize=2*1024*1024)
+    
+    # 使用 resumable 上傳，並直接讀取 file_obj，不進行額外處理
+    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True)
     
     file = service.files().create(
         body=file_metadata, media_body=media, fields='id, webViewLink'
@@ -91,7 +94,6 @@ def get_tw_time():
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
 def check_is_photo_today(uploaded_file):
-    """EXIF 檢查 (僅適用於 file_uploader)"""
     try:
         uploaded_file.seek(0)
         image = Image.open(uploaded_file)
@@ -100,7 +102,7 @@ def check_is_photo_today(uploaded_file):
         del image
         gc.collect()
         
-        if not exif_data: return True, "⚠️ 警告：無法讀取拍攝時間 (可能為截圖或網頁相機)，本次放行。"
+        if not exif_data: return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
 
         date_taken_str = None
         for tag, value in exif_data.items():
@@ -135,7 +137,7 @@ except:
 # 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v2.4 (雙相機模式版)")
+    st.markdown("v2.5 (直通上傳版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
@@ -183,19 +185,18 @@ if st.session_state.current_page == "front_end":
             photo = None
             is_checked = False
             
-            # --- v2.4 雙模式切換 ---
             if task_type == "開店-儀容自檢":
                 st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
                 
-                # 模式選擇開關
-                use_webcam = st.toggle("📷 使用「網頁輕量相機」 (若上傳一直閃退請開這個)")
+                # --- v2.5 重要修改 ---
+                use_webcam = st.toggle("📷 使用「網頁輕量相機」 (推薦)")
                 
                 if use_webcam:
-                    st.caption("ℹ️ 輕量模式：相容性高，不佔記憶體，但無法檢查拍攝時間。")
+                    st.warning("⚠️ 若點擊下方按鈕沒反應，請點選 LINE 右上角『使用預設瀏覽器開啟』(Chrome/Safari)。")
                     photo = st.camera_input("請拍攝儀容")
                 else:
-                    st.caption("ℹ️ 標準模式：上傳高畫質照片。**若閃退請改用上方輕量模式**。")
-                    photo = st.file_uploader("選擇相機或圖庫", type=['jpg', 'jpeg', 'png'])
+                    st.caption("ℹ️ 從圖庫上傳：適合已用原相機拍好的照片。")
+                    photo = st.file_uploader("選擇照片", type=['jpg', 'jpeg', 'png'])
             
             else:
                 st.markdown(f"**✅ [{task_type}] 確認執行：**")
@@ -206,8 +207,8 @@ if st.session_state.current_page == "front_end":
                 if not emp_name: err = "❌ 缺姓名"
                 elif task_type == "開店-儀容自檢":
                     if not photo: err = "❌ 缺照片"
-                    # 只有在使用「檔案上傳」時才檢查 EXIF，網頁相機無法檢查
                     elif not use_webcam:
+                        # 只有上傳檔案才檢查 EXIF
                         ok, msg = check_is_photo_today(photo)
                         if not ok: err = msg
                 elif not is_checked: err = "❌ 請勾選確認"
@@ -216,21 +217,27 @@ if st.session_state.current_page == "front_end":
                     st.error(err)
                 else:
                     try:
-                        with st.spinner("處理中..."):
+                        with st.spinner("資料上傳中 (請勿關閉)..."):
                             curr = get_tw_time()
                             link = "無"
                             if photo:
-                                # 網頁相機的照片已經很小，不需要深度壓縮；檔案上傳的才需要
-                                if not use_webcam:
-                                    compressed = compress_image(photo)
+                                final_file = None
+                                
+                                # --- v2.5 核心修改：直通模式 ---
+                                if use_webcam:
+                                    # 網頁相機照片：完全不處理，直接轉傳 (最省記憶體)
+                                    # st.camera_input 回傳的就是 BytesIO，直接用
+                                    final_file = photo
                                 else:
-                                    # 網頁相機直接使用，但仍需轉 BytesIO
-                                    compressed = photo
-                                    
-                                if compressed:
+                                    # 檔案上傳：可能很大，必須壓縮
+                                    final_file = compress_image(photo)
+                                
+                                if final_file:
                                     fname = f"{curr.strftime('%Y-%m-%d')}_{selected_store}_{emp_name}_{task_type}.jpg"
-                                    link = upload_to_drive(compressed, fname)
-                                    del compressed
+                                    link = upload_to_drive(final_file, fname)
+                                    
+                                    # 釋放記憶體
+                                    del final_file
                                     gc.collect()
                             
                             row = [curr.strftime("%Y-%m-%d %H:%M:%S"), curr.strftime("%Y-%m-%d"), 
@@ -239,7 +246,7 @@ if st.session_state.current_page == "front_end":
                             st.success("✅ 成功！")
                             st.rerun()
                     except Exception as e:
-                        st.error(f"錯誤: {e}")
+                        st.error(f"上傳失敗: {e} (建議使用網頁相機或降低畫質)")
                         gc.collect()
 
 # --- 後台 ---
@@ -275,7 +282,6 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
             else: st.info("無照片")
             
     with t2:
-        st.write("今日缺漏")
         today_str = get_tw_time().strftime("%Y-%m-%d")
         if not df_logs.empty:
             td_logs = df_logs[df_logs["日期"] == today_str]
