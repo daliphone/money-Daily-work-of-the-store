@@ -7,7 +7,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
-import gc # 新增：記憶體回收機制
+import gc
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
@@ -27,12 +27,10 @@ TASK_SOP = {
 REQUIRED_TASKS = list(TASK_SOP.keys())
 STORE_LIST = ["文賢店", "東門店", "小西門店", "永康店", "歸仁店", "安中店", "鹽行店", "五甲店"]
 
-# --- 雲端連線函式庫 ---
+# --- 雲端連線 ---
 @st.cache_resource
 def init_connection():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
     return creds
 
 def get_data():
@@ -45,37 +43,26 @@ def get_data():
         df["日期"] = df["日期"].astype(str)
     return df
 
-def compress_image(image_file):
-    """
-    極致優化版：壓縮圖片以防止記憶體溢出
-    """
+def compress_image(image_file, max_width=800):
+    """記憶體友善的壓縮函式"""
     try:
         image = Image.open(image_file)
-        
-        # 1. 修正旋轉 (手機照片常見問題)
-        image = ImageOps.exif_transpose(image)
-        
-        # 2. 轉換為 RGB (丟棄透明通道以節省空間)
+        image = ImageOps.exif_transpose(image) # 轉正
         if image.mode != "RGB":
             image = image.convert("RGB")
-            
-        # 3. 使用 thumbnail 進行縮圖 (比 resize 更省記憶體)
-        # 將最大寬度限制在 800px (足夠辨識儀容)
-        image.thumbnail((800, 800), Image.Resampling.LANCZOS)
         
-        # 4. 壓縮存入 Buffer
+        # 使用 thumbnail 原地縮圖，極大節省記憶體
+        image.thumbnail((max_width, max_width), Image.Resampling.LANCZOS)
+        
         output = io.BytesIO()
-        # quality=50 是可接受的最低畫質，能極大化壓縮比
+        # 畫質降至 50 以確保上傳順暢
         image.save(output, format="JPEG", quality=50, optimize=True)
         output.seek(0)
         
-        # 5. 強制釋放原始圖片記憶體
         del image
-        gc.collect() 
-        
+        gc.collect()
         return output
     except Exception as e:
-        st.error(f"圖片處理失敗 (記憶體不足): {e}")
         return None
 
 def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
@@ -84,9 +71,7 @@ def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
     folder_id = st.secrets["drive_folder_id"]
     
     file_metadata = {'name': filename, 'parents': [folder_id]}
-    
-    # Chunk size 設定為 5MB，避免一次佔用太多
-    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True, chunksize=5*1024*1024)
+    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True, chunksize=2*1024*1024)
     
     file = service.files().create(
         body=file_metadata, media_body=media, fields='id, webViewLink'
@@ -94,7 +79,6 @@ def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
     
     permission = {'type': 'anyone', 'role': 'reader'}
     service.permissions().create(fileId=file.get('id'), body=permission).execute()
-    
     return file.get('webViewLink')
 
 def save_data(row_data):
@@ -106,45 +90,35 @@ def save_data(row_data):
 def get_tw_time():
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
-# --- EXIF 檢查 ---
 def check_is_photo_today(uploaded_file):
+    """EXIF 檢查 (僅適用於 file_uploader)"""
     try:
         uploaded_file.seek(0)
-        # 僅讀取 Header，不載入圖片數據
         image = Image.open(uploaded_file)
         exif_data = image._getexif()
         uploaded_file.seek(0)
-        
-        # 立即釋放 Image 物件
         del image
         gc.collect()
         
-        if not exif_data:
-            return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
+        if not exif_data: return True, "⚠️ 警告：無法讀取拍攝時間 (可能為截圖或網頁相機)，本次放行。"
 
         date_taken_str = None
         for tag, value in exif_data.items():
-            decoded = ExifTags.TAGS.get(tag, tag)
-            if decoded == "DateTimeOriginal":
+            if ExifTags.TAGS.get(tag, tag) == "DateTimeOriginal":
                 date_taken_str = value
                 break
         
         if date_taken_str:
-            try:
-                date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
-                today_str = get_tw_time().strftime("%Y-%m-%d")
-                photo_date_str = date_obj.strftime("%Y-%m-%d")
-                if photo_date_str == today_str:
-                    return True, "✅ 照片為今日拍攝"
-                else:
-                    return False, f"❌ 錯誤：照片拍攝於 {photo_date_str}，非今日！"
-            except:
-                return True, "⚠️ 日期格式解析失敗，放行。"
-        else:
-            return True, "⚠️ 照片無日期資訊，放行。"
-    except Exception as e:
+            date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
+            today_str = get_tw_time().strftime("%Y-%m-%d")
+            if date_obj.strftime("%Y-%m-%d") == today_str:
+                return True, "✅ 照片為今日拍攝"
+            else:
+                return False, f"❌ 錯誤：照片拍攝於 {date_obj.strftime('%Y-%m-%d')}，非今日！"
+        return True, "⚠️ 無日期資訊，放行。"
+    except:
         uploaded_file.seek(0)
-        return True, f"⚠️ 讀取錯誤: {e}"
+        return True, "⚠️ 讀取錯誤，略過檢查。"
 
 # --- 主程式 ---
 
@@ -155,224 +129,160 @@ if 'current_page' not in st.session_state:
 
 try:
     df_logs = get_data()
-except Exception as e:
-    # 這裡只顯示簡單錯誤，避免嚇到使用者
+except:
     df_logs = pd.DataFrame(columns=["時間", "日期", "門市", "員工姓名", "任務項目", "狀態", "照片連結", "系統計點"])
 
 # 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v2.3 (極致省記憶體版)")
+    st.markdown("v2.4 (雙相機模式版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
             st.rerun()
 
-# --- 頁面邏輯 ---
-
-# A. 前台回報
+# --- 前台 ---
 if st.session_state.current_page == "front_end":
     st.header("📋 門市每日職責回報")
-    
-    if st.button("🔄 刷新看板數據"):
-        st.rerun()
+    if st.button("🔄 刷新看板"): st.rerun()
 
     selected_store = st.selectbox("🏬 請先選擇所屬門市", ["請選擇..."] + STORE_LIST, key="store_selector")
 
     if selected_store != "請選擇...":
-        st.info(f"📊 [{selected_store}] 今日作業進度看板 (即時同步)", icon="📅")
-        
-        tw_now = get_tw_time()
-        today_str = tw_now.strftime("%Y-%m-%d")
+        # 看板邏輯
+        st.info(f"📊 [{selected_store}] 今日作業進度", icon="📅")
+        today_str = get_tw_time().strftime("%Y-%m-%d")
         
         if not df_logs.empty and "日期" in df_logs.columns:
             df_logs["日期"] = df_logs["日期"].astype(str)
-            daily_logs = df_logs[
-                (df_logs["門市"] == selected_store) & 
-                (df_logs["日期"] == today_str)
-            ]
+            daily_logs = df_logs[(df_logs["門市"] == selected_store) & (df_logs["日期"] == today_str)]
         else:
             daily_logs = pd.DataFrame()
 
         status_cols = st.columns(len(REQUIRED_TASKS))
         for i, task in enumerate(REQUIRED_TASKS):
             with status_cols[i]:
-                task_records = daily_logs[daily_logs["任務項目"] == task] if not daily_logs.empty else pd.DataFrame()
-                clean_name = task.split("-")[1]
-                st.markdown(f"**{clean_name}**")
-                
+                recs = daily_logs[daily_logs["任務項目"] == task] if not daily_logs.empty else pd.DataFrame()
+                st.markdown(f"**{task.split('-')[1]}**")
                 if task == "開店-儀容自檢":
-                    if not task_records.empty:
-                        names = task_records["員工姓名"].unique().tolist()
-                        st.success(f"已完成：\n{', '.join(names)}")
-                    else:
-                        st.warning("尚無人打卡")
+                    if not recs.empty: st.success(f"已完成:\n{','.join(recs['員工姓名'].unique())}")
+                    else: st.warning("未打卡")
                 else:
-                    if not task_records.empty:
-                        doer = task_records.iloc[0]["員工姓名"]
-                        st.success(f"✅ 已完成\n({doer})")
-                    else:
-                        st.error("❌ 未執行")
+                    if not recs.empty: st.success(f"✅ 已完成")
+                    else: st.error("❌ 未執行")
 
         st.divider()
 
-        col_task_select, col_sop = st.columns([1, 2])
-        with col_task_select:
-            task_type = st.selectbox("📌 選擇今日要執行的項目", REQUIRED_TASKS, key="task_selector")
-        with col_sop:
-            if task_type: st.info(TASK_SOP[task_type], icon="ℹ️")
+        # 回報區
+        c1, c2 = st.columns([1, 2])
+        task_type = c1.selectbox("📌 選擇今日要執行的項目", REQUIRED_TASKS)
+        if task_type: c2.info(TASK_SOP[task_type])
 
         with st.form("task_form", clear_on_submit=True):
             emp_name = st.text_input("執行員工姓名")
             photo = None
             is_checked = False
             
+            # --- v2.4 雙模式切換 ---
             if task_type == "開店-儀容自檢":
                 st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
-                st.caption("⚠️ 注意：若照片過大可能導致系統重啟，建議使用普通畫質拍攝。")
-                photo = st.file_uploader("點擊開啟相機", type=['jpg', 'jpeg', 'png'])
+                
+                # 模式選擇開關
+                use_webcam = st.toggle("📷 使用「網頁輕量相機」 (若上傳一直閃退請開這個)")
+                
+                if use_webcam:
+                    st.caption("ℹ️ 輕量模式：相容性高，不佔記憶體，但無法檢查拍攝時間。")
+                    photo = st.camera_input("請拍攝儀容")
+                else:
+                    st.caption("ℹ️ 標準模式：上傳高畫質照片。**若閃退請改用上方輕量模式**。")
+                    photo = st.file_uploader("選擇相機或圖庫", type=['jpg', 'jpeg', 'png'])
+            
             else:
                 st.markdown(f"**✅ [{task_type}] 確認執行：**")
-                is_checked = st.checkbox(f"我已閱讀 SOP 並完成 [{task_type}]")
+                is_checked = st.checkbox("我已閱讀 SOP 並完成")
             
-            submit = st.form_submit_button("確認提交", use_container_width=True)
-            
-            if submit:
-                error_msg = ""
-                
-                if not emp_name:
-                    error_msg = "❌ 請輸入員工姓名！"
+            if st.form_submit_button("確認提交"):
+                err = ""
+                if not emp_name: err = "❌ 缺姓名"
                 elif task_type == "開店-儀容自檢":
-                    if not photo:
-                        error_msg = "❌ 必須上傳照片！"
-                    else:
-                        pass_exif, exif_msg = check_is_photo_today(photo)
-                        if not pass_exif: error_msg = exif_msg
-
-                elif task_type != "開店-儀容自檢" and not is_checked:
-                    error_msg = "❌ 請勾選確認已執行！"
+                    if not photo: err = "❌ 缺照片"
+                    # 只有在使用「檔案上傳」時才檢查 EXIF，網頁相機無法檢查
+                    elif not use_webcam:
+                        ok, msg = check_is_photo_today(photo)
+                        if not ok: err = msg
+                elif not is_checked: err = "❌ 請勾選確認"
                 
-                if error_msg:
-                    st.error(error_msg)
+                if err:
+                    st.error(err)
                 else:
-                    status_placeholder = st.empty()
-                    status_placeholder.info("⏳ 正在處理影像 (請勿關閉)...")
-                    
                     try:
-                        current_tw = get_tw_time()
-                        time_str = current_tw.strftime("%Y-%m-%d %H:%M:%S")
-                        date_str = current_tw.strftime("%Y-%m-%d")
-                        
-                        photo_link = "無"
-                        if photo:
-                            # 進行極致壓縮
-                            compressed_image = compress_image(photo)
-                            if compressed_image:
-                                file_name = f"{date_str}_{selected_store}_{emp_name}_{task_type}.jpg"
-                                photo_link = upload_to_drive(compressed_image, file_name)
-                                # 再次手動釋放記憶體
-                                del compressed_image
-                                gc.collect()
-                            else:
-                                st.error("❌ 圖片處理失敗 (檔案可能過大)，請重試。")
-                                st.stop()
-                        
-                        row = [
-                            time_str, date_str, selected_store, emp_name, 
-                            task_type, "✅ 已提交", photo_link, 0
-                        ]
-                        
-                        save_data(row)
-                        status_placeholder.success("✅ 提交成功！")
-                        # 強制釋放所有未使用的記憶體
-                        gc.collect()
-                        st.rerun()
-                        
+                        with st.spinner("處理中..."):
+                            curr = get_tw_time()
+                            link = "無"
+                            if photo:
+                                # 網頁相機的照片已經很小，不需要深度壓縮；檔案上傳的才需要
+                                if not use_webcam:
+                                    compressed = compress_image(photo)
+                                else:
+                                    # 網頁相機直接使用，但仍需轉 BytesIO
+                                    compressed = photo
+                                    
+                                if compressed:
+                                    fname = f"{curr.strftime('%Y-%m-%d')}_{selected_store}_{emp_name}_{task_type}.jpg"
+                                    link = upload_to_drive(compressed, fname)
+                                    del compressed
+                                    gc.collect()
+                            
+                            row = [curr.strftime("%Y-%m-%d %H:%M:%S"), curr.strftime("%Y-%m-%d"), 
+                                   selected_store, emp_name, task_type, "✅ 已提交", link, 0]
+                            save_data(row)
+                            st.success("✅ 成功！")
+                            st.rerun()
                     except Exception as e:
-                        st.error(f"系統錯誤: {e}")
-                        gc.collect() # 發生錯誤也要清理記憶體
+                        st.error(f"錯誤: {e}")
+                        gc.collect()
 
-# B. 後台
+# --- 後台 ---
 elif st.session_state.current_page in ["backend_login", "backend_main"]:
     st.header("🔐 管理後台")
-    
     if not st.session_state.is_admin_logged_in:
-        pwd = st.text_input("密碼", type="password")
-        c1, c2 = st.columns([1, 4])
-        if c1.button("登入"):
-            if pwd == "1234":
-                st.session_state.is_admin_logged_in = True
-                st.session_state.current_page = "backend_main"
+        p = st.text_input("密碼", type="password")
+        if st.button("登入"): 
+            if p=="1234": 
+                st.session_state.is_admin_logged_in=True
+                st.session_state.current_page="backend_main"
                 st.rerun()
-            else:
-                st.error("❌ 錯誤")
-        if c2.button("🔙 返回前台"):
-            st.session_state.current_page = "front_end"
+        if st.button("回前台"): 
+            st.session_state.current_page="front_end"
             st.rerun()
         st.stop()
 
     c1, c2 = st.columns([1, 5])
-    if c1.button("🔙 返回前台"):
-        st.session_state.current_page = "front_end"
+    if c1.button("🔙 回前台"):
+        st.session_state.current_page="front_end"
         st.rerun()
-    if c2.button("登出"):
-        st.session_state.is_admin_logged_in = False
-        st.session_state.current_page = "front_end"
-        st.rerun()
-        
+    
     st.divider()
+    t1, t2 = st.tabs(["回報列表", "缺漏表"])
     
-    tab1, tab2, tab3 = st.tabs(["📊 回報列表", "⚠️ 缺漏檢核", "📈 統計報表"])
-    
-    with tab1:
-        st.write("💡 資料來源：Google Sheets (即時同步)")
-        display_df = df_logs.copy()
-        st.dataframe(display_df, use_container_width=True)
-        
-        st.divider()
-        st.subheader("🔍 照片檢視")
+    with t1:
+        st.dataframe(df_logs, use_container_width=True)
         if not df_logs.empty:
-            options = df_logs.index.tolist()
-            select_idx = st.selectbox(
-                "選擇紀錄", 
-                options, 
-                format_func=lambda x: f"{df_logs.at[x, '日期']} {df_logs.at[x, '門市']} - {df_logs.at[x, '員工姓名']} ({df_logs.at[x, '任務項目']})"
-            )
+            opts = df_logs.index.tolist()
+            idx = st.selectbox("查看照片", opts, format_func=lambda x: f"{df_logs.at[x,'門市']} {df_logs.at[x,'員工姓名']}")
+            link = df_logs.at[idx, "照片連結"]
+            if "http" in str(link): st.markdown(f"[📷 點此開啟照片]({link})")
+            else: st.info("無照片")
             
-            link = df_logs.at[select_idx, "照片連結"]
-            if "http" in str(link):
-                st.image(link, caption="點擊右上角可放大", width=400)
-                st.markdown(f"[🔗 點此開啟原始圖片]({link})")
-            else:
-                st.info("此紀錄無照片連結")
-
-    with tab2:
-        st.subheader("⚠️ 今日缺漏 (即時)")
+    with t2:
+        st.write("今日缺漏")
         today_str = get_tw_time().strftime("%Y-%m-%d")
-        
-        report_status = []
-        if not df_logs.empty and "日期" in df_logs.columns:
-            today_logs = df_logs[df_logs["日期"] == today_str]
-        else:
-            today_logs = pd.DataFrame()
-            
-        for store in STORE_LIST:
-            store_logs = today_logs[today_logs["門市"] == store]
-            completed = store_logs["任務項目"].unique().tolist()
-            store_tasks = [t for t in REQUIRED_TASKS if t != "開店-儀容自檢"]
-            missing = [t for t in store_tasks if t not in completed]
-            
-            report_status.append({
-                "門市": store,
-                "未完成數": len(missing),
-                "未完成項目": ", ".join(missing) if missing else "✅ All Done"
-            })
-        st.dataframe(pd.DataFrame(report_status), use_container_width=True)
-
-    with tab3:
-        st.subheader("📈 統計")
         if not df_logs.empty:
-            rank_df = df_logs.groupby("門市").size().reset_index(name="回報次數")
-            st.bar_chart(rank_df, x="門市", y="回報次數")
-        else:
-            st.info("尚無數據")
+            td_logs = df_logs[df_logs["日期"] == today_str]
+            res = []
+            for s in STORE_LIST:
+                sl = td_logs[td_logs["門市"]==s]
+                comp = sl["任務項目"].unique()
+                miss = [t for t in REQUIRED_TASKS if t!="開店-儀容自檢" and t not in comp]
+                res.append({"門市":s, "未完成": ",".join(miss) if miss else "✅ Done"})
+            st.dataframe(pd.DataFrame(res), use_container_width=True)
