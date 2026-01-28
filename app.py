@@ -11,18 +11,18 @@ import io
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
 
 # --- 設定區 ---
-GOOGLE_FORM_URL = "https://forms.gle/1KHVtYzo785LnVKb7" # 短網址
+GOOGLE_FORM_URL = "https://forms.gle/1KHVtYzo785LnVKb7"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 TASK_SOP = {
-    "開店-儀容自檢": "📋 執行重點：全體員工皆需執行。確認穿著制服、配戴名牌，頭髮梳理整齊。",
-    "開店-環境清掃": "🧹 執行重點：門市公用事項。櫃台桌面擦拭、店內地面掃拖、玻璃門清潔。",
-    "營業-零用金確認": "💰 執行重點：門市公用事項。清點收銀機內零用金，確認金額正確無誤。",
-    "營業-隨機抽盤": "📱 執行重點：門市公用事項。隨機挑選 3-5 樣高單價商品，核對數量。",
-    "閉店-庫存表上傳": "📊 執行重點：門市公用事項。執行日結作業，產出今日庫存報表。"
+    "開店-儀容自檢": "📋 重點：確認穿著制服、配戴名牌。",
+    "開店-環境清掃": "🧹 重點：櫃台、地面、玻璃清潔。",
+    "營業-零用金確認": "💰 重點：清點收銀機金額。",
+    "營業-隨機抽盤": "📱 重點：挑選 3-5 樣商品核對。",
+    "閉店-庫存表上傳": "📊 重點：執行日結，產出報表。"
 }
 REQUIRED_TASKS = list(TASK_SOP.keys())
 STORE_LIST = ["文賢店", "東門店", "小西門店", "永康店", "歸仁店", "安中店", "鹽行店", "五甲店"]
@@ -34,28 +34,18 @@ def init_connection():
     return creds
 
 def get_data():
-    """v4.3 絕對防禦版：強制補全缺失欄位，永不崩潰"""
-    # 定義系統運作「絕對必須」的欄位
+    """v4.3 絕對防禦版核心"""
     MUST_HAVE_COLS = ["時間", "日期", "門市", "員工姓名", "任務項目", "照片", "確認"]
-    
     try:
         creds = init_connection()
         client = gspread.authorize(creds)
-        
-        # 改用 get_worksheet(0) 抓取「第一個分頁」，不管它叫什麼名字
         sheet = client.open("馬尼通訊即時回報系統_DB").get_worksheet(0)
-            
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
         
-        # 1. 處理空表
-        if df.empty:
-            return pd.DataFrame(columns=MUST_HAVE_COLS)
+        if df.empty: return pd.DataFrame(columns=MUST_HAVE_COLS)
 
-        # 2. 清理欄位名稱 (去除空白)
         df.columns = [str(c).strip() for c in df.columns]
-        
-        # 3. 智慧改名 (處理 Google 表單的長標題)
         rename_map = {
             "時間戳記": "時間", "Timestamp": "時間",
             "請問您所屬的門市": "門市", "請問您所屬的門市？": "門市",
@@ -63,7 +53,6 @@ def get_data():
             "今日執行項目": "任務項目", "任務項目 (請選擇)": "任務項目",
             "上傳照片": "照片", "照片 (如有)": "照片"
         }
-        # 模糊比對改名
         new_columns = {}
         for col in df.columns:
             for key in rename_map:
@@ -72,15 +61,10 @@ def get_data():
                     break
         df.rename(columns=new_columns, inplace=True)
 
-        # 4. 【絕對防禦】如果改完名還是缺欄位，直接強制建立空欄位
-        # 這能保證 df['門市'] 永遠存在，絕對不會報 KeyError
         current_cols = df.columns.tolist()
         for col in MUST_HAVE_COLS:
-            if col not in current_cols:
-                # 建立全空的該欄位
-                df[col] = None 
+            if col not in current_cols: df[col] = None 
                 
-        # 5. 資料格式化
         if "時間" in df.columns:
             df["時間"] = pd.to_datetime(df["時間"], errors='coerce')
             df["日期"] = df["時間"].dt.strftime("%Y-%m-%d")
@@ -89,9 +73,7 @@ def get_data():
             df["日期"] = datetime.now().strftime("%Y-%m-%d")
             
         return df
-        
-    except Exception as e:
-        # 萬一連 Google Sheet 都連不上，回傳空表
+    except:
         return pd.DataFrame(columns=MUST_HAVE_COLS)
 
 def get_tw_time():
@@ -108,7 +90,7 @@ def download_image_and_check_exif(drive_url):
         file_content = io.BytesIO(request.execute())
         image = Image.open(file_content)
         exif_data = image._getexif()
-        check_msg = "⚠️ 警告：無拍攝時間資訊"
+        check_msg = "⚠️ 警告：無 EXIF 時間"
         is_today = True 
         if exif_data:
             for tag, value in exif_data.items():
@@ -127,38 +109,66 @@ def download_image_and_check_exif(drive_url):
     except Exception as e:
         return True, f"讀取失敗: {str(e)}", None
 
+# --- 自動記點核心運算 ---
+def calculate_missing_points(df):
+    """計算所有門市的歷史缺點"""
+    if df.empty: return pd.DataFrame()
+    
+    # 1. 找出資料庫中所有出現過的「日期」
+    dates = df["日期"].unique()
+    
+    penalty_records = []
+    
+    # 2. 遍歷每一天、每一家店
+    for d in dates:
+        # 當日資料
+        daily_data = df[df["日期"] == d]
+        
+        for store in STORE_LIST:
+            # 該店當日完成的任務
+            store_done = daily_data[daily_data["門市"] == store]["任務項目"].unique().tolist()
+            
+            # 找出缺少的任務
+            # 邏輯：必做清單 - 已做清單
+            missing_tasks = list(set(REQUIRED_TASKS) - set(store_done))
+            missing_count = len(missing_tasks)
+            
+            if missing_count > 0:
+                penalty_records.append({
+                    "日期": d,
+                    "門市": store,
+                    "缺點數 (未回報)": missing_count,
+                    "未完成項目": ", ".join(missing_tasks)
+                })
+                
+    return pd.DataFrame(penalty_records)
+
 # --- 主程式 ---
 if 'is_admin_logged_in' not in st.session_state:
     st.session_state.is_admin_logged_in = False
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "front_end"
 
-# 讀取資料
 df_logs = get_data()
 
-# 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v4.3 (絕對防禦版)")
-    # 顯示目前偵測到的欄位，方便除錯
-    st.caption(f"偵測欄位: {list(df_logs.columns)}")
-    
+    st.markdown("v5.0 (自動記點版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
             st.rerun()
 
+# --- 前台 ---
 if st.session_state.current_page == "front_end":
     st.header("📋 門市每日職責回報")
     selected_store = st.selectbox("🏬 請先選擇所屬門市", ["請選擇..."] + STORE_LIST)
     
     if selected_store != "請選擇...":
-        st.info(f"📊 [{selected_store}] 今日作業進度 (資料來源：Google 表單)", icon="📅")
+        st.info(f"📊 [{selected_store}] 今日作業進度", icon="📅")
         if st.button("🔄 刷新看板"): st.rerun()
 
         today_str = get_tw_time().strftime("%Y-%m-%d")
-        
-        # 這裡絕對安全，因為 v4.3 保證了 "門市" 和 "日期" 欄位一定存在
         if not df_logs.empty:
             daily_logs = df_logs[(df_logs["門市"] == selected_store) & (df_logs["日期"] == today_str)]
         else:
@@ -167,11 +177,9 @@ if st.session_state.current_page == "front_end":
         status_cols = st.columns(len(REQUIRED_TASKS))
         for i, task in enumerate(REQUIRED_TASKS):
             with status_cols[i]:
-                # 安全存取
                 if not daily_logs.empty and "任務項目" in daily_logs.columns:
                     recs = daily_logs[daily_logs["任務項目"] == task]
-                else:
-                    recs = pd.DataFrame()
+                else: recs = pd.DataFrame()
                     
                 st.markdown(f"**{task.split('-')[1]}**")
                 if task == "開店-儀容自檢":
@@ -189,6 +197,7 @@ if st.session_state.current_page == "front_end":
     st.link_button("🚀 點此前往 Google 表單回報", GOOGLE_FORM_URL, type="primary")
     st.caption("💡 填寫完畢後，請點擊表單最後的連結回到此處確認看板狀態。")
 
+# --- 後台 ---
 elif st.session_state.current_page in ["backend_login", "backend_main"]:
     st.header("🔐 管理後台")
     if not st.session_state.is_admin_logged_in:
@@ -213,7 +222,9 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
         st.rerun()
     
     st.divider()
-    t1, t2 = st.tabs(["回報列表", "缺漏表"])
+    t1, t2, t3 = st.tabs(["📝 回報稽核", "⚠️ 缺漏警示 (今日)", "📉 自動記點排行榜"])
+    
+    # Tab 1: 稽核 (檢查 EXIF)
     with t1:
         if not df_logs.empty:
             opts = df_logs.index.tolist()
@@ -223,7 +234,7 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
             with c_img:
                 p_url = df_logs.at[sel, "照片"] if df_logs.at[sel, "照片"] else None
                 if p_url:
-                    with st.spinner("下載照片檢查 EXIF..."):
+                    with st.spinner("檢查 EXIF..."):
                         ok, msg, img = download_image_and_check_exif(p_url)
                     if img: st.image(img, width=400)
                     if "異常" in msg: st.error(msg)
@@ -234,17 +245,65 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
             st.dataframe(df_logs, use_container_width=True)
         else: st.info("目前無資料")
     
+    # Tab 2: 今日缺漏
     with t2:
         today_str = get_tw_time().strftime("%Y-%m-%d")
+        st.subheader(f"📅 今日 ({today_str}) 缺漏狀況")
         if not df_logs.empty:
             td = df_logs[df_logs["日期"] == today_str]
             res = []
             for s in STORE_LIST:
                 sl = td[td["門市"]==s]
-                # 安全存取
-                if "任務項目" in sl.columns:
-                    miss = [t for t in REQUIRED_TASKS if t!="開店-儀容自檢" and t not in sl["任務項目"].unique()]
-                else:
-                    miss = ["資料異常"]
-                res.append({"門市":s, "未完成": ",".join(miss) if miss else "✅ Done"})
-            st.dataframe(pd.DataFrame(res), use_container_width=True)
+                # 找出沒做的
+                miss = [t for t in REQUIRED_TASKS if t not in sl["任務項目"].unique()]
+                # 計算今日缺點
+                points = len(miss)
+                # 儀容自檢如果沒人做也算缺點，但顯示上特別標註
+                note = ""
+                if "開店-儀容自檢" in miss: note = "(含儀容未打卡)"
+                
+                status = f"✅ All Done" if not miss else f"❌ 缺 {points} 項"
+                
+                res.append({
+                    "門市": s, 
+                    "狀態": status,
+                    "系統自動記點": points,
+                    "未完成項目": ", ".join(miss)
+                })
+            
+            # 將有缺點的排前面
+            df_res = pd.DataFrame(res).sort_values(by="系統自動記點", ascending=False)
+            st.dataframe(df_res, use_container_width=True)
+        else:
+            st.info("今日尚無任何資料")
+
+    # Tab 3: 自動記點統計 (新功能)
+    with t3:
+        st.subheader("📉 門市累計缺點排行榜 (自動計算)")
+        st.caption("💡 說明：系統會自動計算歷史資料中，每日每店「未回報」的項目數量，每少一項記 1 點。")
+        
+        if not df_logs.empty:
+            # 1. 執行運算
+            df_penalty = calculate_missing_points(df_logs)
+            
+            if not df_penalty.empty:
+                c_chart, c_data = st.columns([1, 1])
+                
+                with c_chart:
+                    # 依門市加總缺點
+                    rank_df = df_penalty.groupby("門市")["缺點數 (未回報)"].sum().reset_index()
+                    rank_df = rank_df.sort_values(by="缺點數 (未回報)", ascending=False)
+                    st.bar_chart(rank_df, x="門市", y="缺點數 (未回報)", color="#FF4B4B")
+                
+                with c_data:
+                    st.write("📊 **缺點總表**")
+                    st.dataframe(rank_df, use_container_width=True)
+                
+                st.divider()
+                st.write("🔍 **每日扣分明細 (可展開查看)**")
+                with st.expander("點擊查看詳細扣分紀錄"):
+                    st.dataframe(df_penalty.sort_values(by="日期", ascending=False), use_container_width=True)
+            else:
+                st.success("🎉 太棒了！目前資料庫中沒有任何缺漏紀錄。")
+        else:
+            st.info("尚無資料可計算")
