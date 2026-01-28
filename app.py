@@ -1,12 +1,20 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from PIL import Image, ExifTags
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
 
-# --- 設定全域變數 ---
+# --- 全域變數 ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 TASK_SOP = {
     "開店-儀容自檢": "📋 執行重點：全體員工皆需執行。確認穿著制服、配戴名牌，頭髮梳理整齊。",
     "開店-環境清掃": "🧹 執行重點：門市公用事項。櫃台桌面擦拭、店內地面掃拖、玻璃門清潔。",
@@ -14,29 +22,81 @@ TASK_SOP = {
     "營業-隨機抽盤": "📱 執行重點：門市公用事項。隨機挑選 3-5 樣高單價商品，核對數量。",
     "閉店-庫存表上傳": "📊 執行重點：門市公用事項。執行日結作業，產出今日庫存報表。"
 }
-
 REQUIRED_TASKS = list(TASK_SOP.keys())
+STORE_LIST = ["文賢店", "東門店", "小西門店", "永康店", "歸仁店", "安中店", "鹽行店", "五甲店"]
 
-STORE_LIST = [
-    "文賢店", "東門店", "小西門店", "永康店", 
-    "歸仁店", "安中店", "鹽行店", "五甲店"
-]
+# --- 雲端連線函式庫 (核心) ---
+@st.cache_resource
+def init_connection():
+    """初始化 Google 雲端連線"""
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return creds
 
-# --- 輔助函式：檢查照片 EXIF 時間 ---
+def get_data():
+    """從 Google Sheet 讀取最新資料"""
+    creds = init_connection()
+    client = gspread.authorize(creds)
+    # 打開試算表 (請確保名稱正確)
+    sheet = client.open("馬尼通訊DB").sheet1
+    data = sheet.get_all_records()
+    df = pd.DataFrame(data)
+    
+    # 強制轉換日期欄位，避免空值報錯
+    if not df.empty and "日期" in df.columns:
+        df["日期"] = df["日期"].astype(str)
+        
+    return df
+
+def upload_to_drive(file_obj, filename):
+    """上傳照片到 Google Drive 並回傳公開連結"""
+    creds = init_connection()
+    service = build('drive', 'v3', credentials=creds)
+    folder_id = st.secrets["drive_folder_id"]
+    
+    file_metadata = {
+        'name': filename,
+        'parents': [folder_id]
+    }
+    media = MediaIoBaseUpload(file_obj, mimetype=file_obj.type)
+    
+    file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, webViewLink'
+    ).execute()
+    
+    # 設定權限為「擁有連結者皆可讀取」(為了讓 Streamlit 能顯示圖片)
+    permission = {'type': 'anyone', 'role': 'reader'}
+    service.permissions().create(
+        fileId=file.get('id'),
+        body=permission
+    ).execute()
+    
+    return file.get('webViewLink')
+
+def save_data(row_data):
+    """寫入一筆資料到 Google Sheet"""
+    creds = init_connection()
+    client = gspread.authorize(creds)
+    sheet = client.open("馬尼通訊DB").sheet1
+    sheet.append_row(row_data)
+
+def get_tw_time():
+    return datetime.now(timezone.utc) + timedelta(hours=8)
+
+# --- EXIF 檢查 ---
 def check_is_photo_today(uploaded_file):
     try:
-        # 重點修正：先將指標歸零，以免讀取失敗
         uploaded_file.seek(0)
         image = Image.open(uploaded_file)
         exif_data = image._getexif()
-        
-        # 讀取完畢後，務必將指標再次歸零，讓後續程式能存檔
         uploaded_file.seek(0)
         
         if not exif_data:
             return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
 
-        # Tag 36867 = DateTimeOriginal
         date_taken_str = None
         for tag, value in exif_data.items():
             decoded = ExifTags.TAGS.get(tag, tag)
@@ -45,92 +105,75 @@ def check_is_photo_today(uploaded_file):
                 break
         
         if date_taken_str:
-            # EXIF 時間格式通常為 "YYYY:MM:DD HH:MM:SS"
             try:
                 date_obj = datetime.strptime(date_taken_str, "%Y:%m:%d %H:%M:%S")
-                today_str = datetime.now().strftime("%Y-%m-%d")
+                today_str = get_tw_time().strftime("%Y-%m-%d")
                 photo_date_str = date_obj.strftime("%Y-%m-%d")
-                
                 if photo_date_str == today_str:
                     return True, "✅ 照片為今日拍攝"
                 else:
                     return False, f"❌ 錯誤：照片拍攝於 {photo_date_str}，非今日！"
-            except ValueError:
+            except:
                 return True, "⚠️ 日期格式解析失敗，放行。"
         else:
             return True, "⚠️ 照片無日期資訊，放行。"
-            
     except Exception as e:
-        # 發生錯誤也記得歸零
         uploaded_file.seek(0)
-        return True, f"⚠️ 讀取錯誤，略過檢查: {e}"
+        return True, f"⚠️ 讀取錯誤: {e}"
 
-# --- 2. 後端數據初始化 (含自動修復) ---
-if 'mani_live_logs' not in st.session_state:
-    st.session_state.mani_live_logs = pd.DataFrame(columns=[
-        "時間", "門市", "員工姓名", "任務項目", "狀態", "照片物件", "系統計點", "日期"
-    ])
+# --- 主程式 ---
 
-# 自動修復機制：防止舊版 DataFrame 缺少欄位導致後台崩潰
-expected_columns = ["時間", "門市", "員工姓名", "任務項目", "狀態", "照片物件", "系統計點", "日期"]
-current_columns = st.session_state.mani_live_logs.columns.tolist()
-missing_columns = [col for col in expected_columns if col not in current_columns]
-
-if missing_columns:
-    # 如果發現缺欄位，自動補上
-    for col in missing_columns:
-        st.session_state.mani_live_logs[col] = None
-    # 填補日期欄位 (若舊資料無日期，用時間推算)
-    if "日期" in missing_columns and not st.session_state.mani_live_logs.empty:
-        st.session_state.mani_live_logs["日期"] = pd.to_datetime(st.session_state.mani_live_logs["時間"]).dt.strftime("%Y-%m-%d")
-
+# 初始化 Session State
 if 'is_admin_logged_in' not in st.session_state:
     st.session_state.is_admin_logged_in = False
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = "front_end"
 
-# --- 3. 側邊欄 ---
+# 每次重新執行都先抓取最新資料 (Sync)
+try:
+    df_logs = get_data()
+except Exception as e:
+    st.error(f"❌ 無法連線至資料庫，請檢查 Secrets 設定或網路連線。\n錯誤訊息: {e}")
+    df_logs = pd.DataFrame(columns=["時間", "日期", "門市", "員工姓名", "任務項目", "狀態", "照片連結", "系統計點"])
+
+# 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
+with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
+    st.markdown("v2.0 (雲端連線版)")
+    if st.session_state.current_page == "front_end":
+        if st.button("🔐 進入管理後台"):
+            st.session_state.current_page = "backend_login"
+            st.rerun()
 
-with st.sidebar.expander("ℹ️ 系統資訊與版本紀錄", expanded=False):
-    st.markdown("""
-    **版本資訊：v1.4.2 (修復顯示版)**
-    - **2026/01/30 更新：**
-      1. 修復：管理後台無數據問題 (增加資料結構自動校正)。
-      2. 修復：照片上傳後的檔案讀取問題 (Reset Seek)。
-    """)
-    # 緊急重置按鈕 (若資料真的壞掉可用)
-    if st.button("⚠️ 清除所有資料 (重置系統)"):
-        st.session_state.clear()
-        st.rerun()
-        
-    st.divider()
-    is_admin_mode = st.toggle("開啟管理後台模式")
+# --- 頁面邏輯 ---
 
-# --- 4. 邏輯分流 ---
-
-# === 模式 A: 門市同仁回報端 ===
-if not is_admin_mode:
+# A. 前台回報
+if st.session_state.current_page == "front_end":
     st.header("📋 門市每日職責回報")
+    
+    if st.button("🔄 刷新看板數據"):
+        st.rerun()
 
     selected_store = st.selectbox("🏬 請先選擇所屬門市", ["請選擇..."] + STORE_LIST, key="store_selector")
 
     if selected_store != "請選擇...":
+        st.info(f"📊 [{selected_store}] 今日作業進度看板 (即時同步)", icon="📅")
         
-        # --- 看板區塊 ---
-        st.info(f"📊 [{selected_store}] 今日作業進度看板", icon="📅")
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        tw_now = get_tw_time()
+        today_str = tw_now.strftime("%Y-%m-%d")
         
-        # 確保資料表不為空且有日期欄位
-        if not st.session_state.mani_live_logs.empty and "日期" in st.session_state.mani_live_logs.columns:
-            # 處理 NaN 日期 (避免舊資料報錯)
-            st.session_state.mani_live_logs["日期"] = st.session_state.mani_live_logs["日期"].fillna(today_str)
-            
-            daily_logs = st.session_state.mani_live_logs[
-                (st.session_state.mani_live_logs["門市"] == selected_store) & 
-                (st.session_state.mani_live_logs["日期"] == today_str)
+        # 篩選今日該店資料
+        if not df_logs.empty and "日期" in df_logs.columns:
+            # 確保欄位型別一致
+            df_logs["日期"] = df_logs["日期"].astype(str)
+            daily_logs = df_logs[
+                (df_logs["門市"] == selected_store) & 
+                (df_logs["日期"] == today_str)
             ]
         else:
             daily_logs = pd.DataFrame()
 
+        # 看板顯示
         status_cols = st.columns(len(REQUIRED_TASKS))
         for i, task in enumerate(REQUIRED_TASKS):
             with status_cols[i]:
@@ -153,189 +196,154 @@ if not is_admin_mode:
 
         st.divider()
 
-        # --- 回報操作區 ---
+        # 回報區
         col_task_select, col_sop = st.columns([1, 2])
         with col_task_select:
             task_type = st.selectbox("📌 選擇今日要執行的項目", REQUIRED_TASKS, key="task_selector")
-        
         with col_sop:
-            if task_type:
-                st.info(TASK_SOP[task_type], icon="ℹ️")
+            if task_type: st.info(TASK_SOP[task_type], icon="ℹ️")
 
-        st.caption("👇 執行回報區")
         with st.form("task_form", clear_on_submit=True):
-            emp_name = st.text_input("執行員工姓名", key="input_emp_name")
-            
+            emp_name = st.text_input("執行員工姓名")
             photo = None
             is_checked = False
             
             if task_type == "開店-儀容自檢":
                 st.markdown(f"**📸 [{task_type}] 需拍照存證：**")
-                st.caption("💡 提示：點擊下方按鈕後，請選擇「相機」進行拍攝。")
-                photo = st.file_uploader("點擊開啟相機 (勿上傳舊照)", type=['jpg', 'jpeg', 'png'], key="uploader")
+                photo = st.file_uploader("點擊開啟相機", type=['jpg', 'jpeg', 'png'])
             else:
                 st.markdown(f"**✅ [{task_type}] 確認執行：**")
-                is_done_today = False
-                if not daily_logs.empty:
-                     if task_type in daily_logs["任務項目"].values:
-                         is_done_today = True
-                
-                if is_done_today:
-                    st.warning(f"⚠️ 注意：此項目今日已有同仁回報過。")
-                is_checked = st.checkbox(f"我已閱讀 SOP 並完成 [{task_type}]", key="check_exec")
+                is_checked = st.checkbox(f"我已閱讀 SOP 並完成 [{task_type}]")
             
             submit = st.form_submit_button("確認提交", use_container_width=True)
             
             if submit:
                 error_msg = ""
-                pass_exif = True
-                exif_msg = ""
-
+                
+                # 驗證
                 if not emp_name:
-                    error_msg = "❌ 錯誤：請輸入員工姓名！"
+                    error_msg = "❌ 請輸入員工姓名！"
                 elif task_type == "開店-儀容自檢":
                     if not photo:
-                        error_msg = "❌ 錯誤：儀容自檢必須上傳照片！"
+                        error_msg = "❌ 必須上傳照片！"
                     else:
                         pass_exif, exif_msg = check_is_photo_today(photo)
-                        if not pass_exif:
-                            error_msg = exif_msg
-                        elif "警告" in exif_msg:
-                            st.warning(exif_msg)
+                        if not pass_exif: error_msg = exif_msg
 
                 elif task_type != "開店-儀容自檢" and not is_checked:
-                    error_msg = "❌ 錯誤：請勾選確認已執行！"
+                    error_msg = "❌ 請勾選確認已執行！"
                 
                 if error_msg:
                     st.error(error_msg)
                 else:
-                    now = datetime.now()
-                    new_data = {
-                        "時間": now.strftime("%Y-%m-%d %H:%M:%S"), 
-                        "日期": now.strftime("%Y-%m-%d"),
-                        "門市": selected_store, 
-                        "員工姓名": emp_name,
-                        "任務項目": task_type, 
-                        "狀態": "✅ 已提交", 
-                        "照片物件": photo if photo else None,
-                        "系統計點": 0
-                    }
-                    st.session_state.mani_live_logs = pd.concat(
-                        [st.session_state.mani_live_logs, pd.DataFrame([new_data])], 
-                        ignore_index=True
-                    )
-                    st.success(f"提交成功！")
-                    st.rerun()
+                    with st.spinner("資料上傳中 (含照片)..."):
+                        current_tw = get_tw_time()
+                        time_str = current_tw.strftime("%Y-%m-%d %H:%M:%S")
+                        date_str = current_tw.strftime("%Y-%m-%d")
+                        
+                        # 上傳照片 (如有)
+                        photo_link = "無"
+                        if photo:
+                            file_name = f"{date_str}_{selected_store}_{emp_name}_{task_type}.jpg"
+                            photo_link = upload_to_drive(photo, file_name)
+                        
+                        # 準備寫入 Row
+                        row = [
+                            time_str, date_str, selected_store, emp_name, 
+                            task_type, "✅ 已提交", photo_link, 0
+                        ]
+                        
+                        save_data(row)
+                        st.success("✅ 提交成功！資料已同步至雲端。")
+                        st.rerun()
 
-# === 模式 B: 管理後台 ===
-else:
+# B. 後台
+elif st.session_state.current_page in ["backend_login", "backend_main"]:
     st.header("🔐 管理後台")
-
+    
     if not st.session_state.is_admin_logged_in:
-        password = st.text_input("請輸入管理員密碼", type="password", key="admin_pass")
-        if st.button("登入"):
-            if password == "1234":
+        pwd = st.text_input("密碼", type="password")
+        c1, c2 = st.columns([1, 4])
+        if c1.button("登入"):
+            if pwd == "1234":
                 st.session_state.is_admin_logged_in = True
+                st.session_state.current_page = "backend_main"
                 st.rerun()
             else:
-                st.error("❌ 密碼錯誤")
+                st.error("❌ 錯誤")
+        if c2.button("🔙 返回前台"):
+            st.session_state.current_page = "front_end"
+            st.rerun()
         st.stop()
 
-    if st.button("登出管理後台"):
-        st.session_state.is_admin_logged_in = False
+    # 登入後
+    c1, c2 = st.columns([1, 5])
+    if c1.button("🔙 返回前台"):
+        st.session_state.current_page = "front_end"
         st.rerun()
+    if c2.button("登出"):
+        st.session_state.is_admin_logged_in = False
+        st.session_state.current_page = "front_end"
+        st.rerun()
+        
+    st.divider()
     
-    tab1, tab2, tab3 = st.tabs(["📊 即時監控", "⚠️ 缺漏檢核", "📈 統計報表"])
-
+    tab1, tab2, tab3 = st.tabs(["📊 回報列表", "⚠️ 缺漏檢核", "📈 統計報表"])
+    
     with tab1:
-        st.subheader("📢 回報列表")
-        # 重點修正：使用 errors='ignore' 防止因為欄位不存在而崩潰
-        if "照片物件" in st.session_state.mani_live_logs.columns:
-            display_df = st.session_state.mani_live_logs.drop(columns=["照片物件"])
-        else:
-            display_df = st.session_state.mani_live_logs
-            
-        st.dataframe(display_df.sort_values(by="時間", ascending=False), use_container_width=True)
+        st.write("💡 資料來源：Google Sheets (即時同步)")
+        # 顯示 Dataframe (隱藏太長的照片連結)
+        display_df = df_logs.copy()
+        st.dataframe(display_df, use_container_width=True)
         
         st.divider()
-        st.subheader("🔍 抽查與照片")
-        if not st.session_state.mani_live_logs.empty:
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                row_to_audit = st.selectbox(
-                    "選擇紀錄", 
-                    st.session_state.mani_live_logs.index,
-                    format_func=lambda x: f"{st.session_state.mani_live_logs.at[x, '門市']} - {st.session_state.mani_live_logs.at[x, '員工姓名']} - {st.session_state.mani_live_logs.at[x, '任務項目']}",
-                    key="audit_select"
-                )
-                
-                # 再次確認欄位存在才讀取
-                if "照片物件" in st.session_state.mani_live_logs.columns:
-                    photo_obj = st.session_state.mani_live_logs.at[row_to_audit, "照片物件"]
-                else:
-                    photo_obj = None
-                    
-                task_name = st.session_state.mani_live_logs.at[row_to_audit, "任務項目"]
-                
-                if photo_obj:
-                    # 嘗試將指標歸零，以確保能顯示
-                    try:
-                        photo_obj.seek(0)
-                        st.image(photo_obj, caption="員工上傳之回報照片", width=300)
-                    except:
-                        st.error("照片讀取失敗 (可能已過期或損毀)")
-                elif "儀容自檢" in task_name:
-                    st.error("異常：應有照片但未找到")
-                else:
-                    st.info(f"此項目 [{task_name}] 為勾選確認，無須照片。")
-
-            with c2:
-                audit_action = st.selectbox("評分", ["無", "不合格 (扣1點)", "重大違規 (扣2點)", "撤銷"], key="audit_action")
-                if st.button("更新"):
-                    current_points = st.session_state.mani_live_logs.at[row_to_audit, "系統計點"]
-                    if "不合格" in audit_action:
-                        st.session_state.mani_live_logs.at[row_to_audit, "系統計點"] = current_points - 1
-                        st.session_state.mani_live_logs.at[row_to_audit, "狀態"] = "⚠️ 不合格"
-                    elif "重大違規" in audit_action:
-                        st.session_state.mani_live_logs.at[row_to_audit, "系統計點"] = current_points - 2
-                        st.session_state.mani_live_logs.at[row_to_audit, "狀態"] = "❌ 重大違規"
-                    elif "撤銷" in audit_action:
-                        st.session_state.mani_live_logs.at[row_to_audit, "系統計點"] = 0
-                        st.session_state.mani_live_logs.at[row_to_audit, "狀態"] = "✅ 已修正"
-                    st.rerun()
+        st.subheader("🔍 照片檢視")
+        if not df_logs.empty:
+            # 建立選單
+            options = df_logs.index.tolist()
+            # 讓選單顯示更清楚的資訊
+            select_idx = st.selectbox(
+                "選擇紀錄", 
+                options, 
+                format_func=lambda x: f"{df_logs.at[x, '日期']} {df_logs.at[x, '門市']} - {df_logs.at[x, '員工姓名']} ({df_logs.at[x, '任務項目']})"
+            )
+            
+            link = df_logs.at[select_idx, "照片連結"]
+            if "http" in str(link):
+                st.image(link, caption="點擊右上角可放大", width=400)
+                st.markdown(f"[🔗 點此開啟原始圖片]({link})")
+            else:
+                st.info("此紀錄無照片連結")
 
     with tab2:
-        st.subheader("⚠️ 每日缺漏檢核")
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        if st.session_state.mani_live_logs.empty:
-            st.warning("尚無數據。")
+        st.subheader("⚠️ 今日缺漏 (即時)")
+        today_str = get_tw_time().strftime("%Y-%m-%d")
+        
+        report_status = []
+        if not df_logs.empty and "日期" in df_logs.columns:
+            today_logs = df_logs[df_logs["日期"] == today_str]
         else:
-            report_status = []
-            # 確保有日期欄位
-            if "日期" in st.session_state.mani_live_logs.columns:
-                df_clean = st.session_state.mani_live_logs.copy()
-                df_clean["日期"] = df_clean["日期"].fillna(today_str)
-                today_logs = df_clean[df_clean["日期"] == today_str]
-            else:
-                today_logs = pd.DataFrame()
-                
-            for store in STORE_LIST:
-                store_logs = today_logs[today_logs["門市"] == store]
-                completed = store_logs["任務項目"].unique().tolist()
-                store_tasks = [t for t in REQUIRED_TASKS if t != "開店-儀容自檢"]
-                missing = [t for t in store_tasks if t not in completed]
-                report_status.append({
-                    "門市": store, 
-                    "公用任務未完成數": len(missing), 
-                    "未完成項目": ", ".join(missing) if missing else "All Done"
-                })
-            st.dataframe(pd.DataFrame(report_status), use_container_width=True)
+            today_logs = pd.DataFrame()
+            
+        for store in STORE_LIST:
+            store_logs = today_logs[today_logs["門市"] == store]
+            completed = store_logs["任務項目"].unique().tolist()
+            # 檢查公用任務
+            store_tasks = [t for t in REQUIRED_TASKS if t != "開店-儀容自檢"]
+            missing = [t for t in store_tasks if t not in completed]
+            
+            report_status.append({
+                "門市": store,
+                "未完成數": len(missing),
+                "未完成項目": ", ".join(missing) if missing else "✅ All Done"
+            })
+        st.dataframe(pd.DataFrame(report_status), use_container_width=True)
 
     with tab3:
-        st.subheader("📈 統計報表")
-        if not st.session_state.mani_live_logs.empty:
-            df_stats = st.session_state.mani_live_logs.copy()
-            rank_df = df_stats.groupby("門市")["系統計點"].sum().reset_index().sort_values(by="系統計點")
-            st.bar_chart(rank_df, x="門市", y="系統計點", color="#FF4B4B")
+        st.subheader("📈 統計 (基於試算表數據)")
+        if not df_logs.empty:
+            # 簡單統計
+            rank_df = df_logs.groupby("門市").size().reset_index(name="回報次數")
+            st.bar_chart(rank_df, x="門市", y="回報次數")
         else:
             st.info("尚無數據")
