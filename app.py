@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageOps # 新增 ImageOps 用於轉正照片
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import io # 新增 io 用於處理記憶體中的壓縮圖
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="馬尼通訊即時管理系統", layout="wide")
@@ -25,32 +26,55 @@ TASK_SOP = {
 REQUIRED_TASKS = list(TASK_SOP.keys())
 STORE_LIST = ["文賢店", "東門店", "小西門店", "永康店", "歸仁店", "安中店", "鹽行店", "五甲店"]
 
-# --- 雲端連線函式庫 (核心) ---
+# --- 雲端連線函式庫 ---
 @st.cache_resource
 def init_connection():
-    """初始化 Google 雲端連線"""
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"], scopes=SCOPES
     )
     return creds
 
 def get_data():
-    """從 Google Sheet 讀取最新資料"""
     creds = init_connection()
     client = gspread.authorize(creds)
-    # 修改點 1: 更新檔名
     sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
-    
-    # 強制轉換日期欄位，避免空值報錯
     if not df.empty and "日期" in df.columns:
         df["日期"] = df["日期"].astype(str)
-        
     return df
 
-def upload_to_drive(file_obj, filename):
-    """上傳照片到 Google Drive 並回傳公開連結"""
+def compress_image(image_file):
+    """
+    功能：壓縮圖片並修正旋轉問題
+    輸入：原始上傳檔案
+    輸出：壓縮後的 BytesIO 物件 (可用於上傳)
+    """
+    image = Image.open(image_file)
+    
+    # 1. 修正手機照片旋轉問題 (EXIF Transpose)
+    image = ImageOps.exif_transpose(image)
+    
+    # 2. 調整尺寸 (若寬度大於 1024px 則等比縮小)
+    max_width = 1024
+    if image.width > max_width:
+        ratio = max_width / image.width
+        new_height = int(image.height * ratio)
+        image = image.resize((max_width, new_height))
+    
+    # 3. 轉換為 RGB (避免 PNG 透明度造成存檔錯誤)
+    if image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
+        
+    # 4. 壓縮存入記憶體
+    output = io.BytesIO()
+    # quality=60 可大幅減少檔案大小但肉眼幾乎看不出差異
+    image.save(output, format="JPEG", quality=60, optimize=True)
+    output.seek(0) # 指標歸零
+    return output
+
+def upload_to_drive(file_obj, filename, mime_type='image/jpeg'):
+    """上傳到 Google Drive"""
     creds = init_connection()
     service = build('drive', 'v3', credentials=creds)
     folder_id = st.secrets["drive_folder_id"]
@@ -59,7 +83,9 @@ def upload_to_drive(file_obj, filename):
         'name': filename,
         'parents': [folder_id]
     }
-    media = MediaIoBaseUpload(file_obj, mimetype=file_obj.type)
+    
+    # 使用 resumable=True 對大檔案較穩定，這裡我們上傳壓縮後的流
+    media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True)
     
     file = service.files().create(
         body=file_metadata,
@@ -67,7 +93,6 @@ def upload_to_drive(file_obj, filename):
         fields='id, webViewLink'
     ).execute()
     
-    # 設定權限為「擁有連結者皆可讀取」
     permission = {'type': 'anyone', 'role': 'reader'}
     service.permissions().create(
         fileId=file.get('id'),
@@ -77,23 +102,22 @@ def upload_to_drive(file_obj, filename):
     return file.get('webViewLink')
 
 def save_data(row_data):
-    """寫入一筆資料到 Google Sheet"""
     creds = init_connection()
     client = gspread.authorize(creds)
-    # 修改點 2: 更新檔名
     sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
     sheet.append_row(row_data)
 
 def get_tw_time():
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
-# --- EXIF 檢查 ---
+# --- EXIF 檢查 (輕量化版) ---
 def check_is_photo_today(uploaded_file):
     try:
         uploaded_file.seek(0)
+        # 這裡只讀取 Header，不載入整張圖，節省記憶體
         image = Image.open(uploaded_file)
         exif_data = image._getexif()
-        uploaded_file.seek(0)
+        uploaded_file.seek(0) # 檢查完畢務必歸零
         
         if not exif_data:
             return True, "⚠️ 警告：無法讀取拍攝時間，本次放行。"
@@ -124,23 +148,21 @@ def check_is_photo_today(uploaded_file):
 
 # --- 主程式 ---
 
-# 初始化 Session State
 if 'is_admin_logged_in' not in st.session_state:
     st.session_state.is_admin_logged_in = False
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "front_end"
 
-# 每次重新執行都先抓取最新資料 (Sync)
 try:
     df_logs = get_data()
 except Exception as e:
-    st.error(f"❌ 無法連線至資料庫，請檢查 Secrets 設定或網路連線。\n錯誤訊息: {e}")
+    st.error(f"❌ 無法連線至資料庫。\n錯誤訊息: {e}")
     df_logs = pd.DataFrame(columns=["時間", "日期", "門市", "員工姓名", "任務項目", "狀態", "照片連結", "系統計點"])
 
 # 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v2.1 (檔名修正版)")
+    st.markdown("v2.2 (圖片壓縮優化版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
@@ -163,9 +185,7 @@ if st.session_state.current_page == "front_end":
         tw_now = get_tw_time()
         today_str = tw_now.strftime("%Y-%m-%d")
         
-        # 篩選今日該店資料
         if not df_logs.empty and "日期" in df_logs.columns:
-            # 確保欄位型別一致
             df_logs["日期"] = df_logs["日期"].astype(str)
             daily_logs = df_logs[
                 (df_logs["門市"] == selected_store) & 
@@ -174,7 +194,6 @@ if st.session_state.current_page == "front_end":
         else:
             daily_logs = pd.DataFrame()
 
-        # 看板顯示
         status_cols = st.columns(len(REQUIRED_TASKS))
         for i, task in enumerate(REQUIRED_TASKS):
             with status_cols[i]:
@@ -197,7 +216,6 @@ if st.session_state.current_page == "front_end":
 
         st.divider()
 
-        # 回報區
         col_task_select, col_sop = st.columns([1, 2])
         with col_task_select:
             task_type = st.selectbox("📌 選擇今日要執行的項目", REQUIRED_TASKS, key="task_selector")
@@ -221,13 +239,13 @@ if st.session_state.current_page == "front_end":
             if submit:
                 error_msg = ""
                 
-                # 驗證
                 if not emp_name:
                     error_msg = "❌ 請輸入員工姓名！"
                 elif task_type == "開店-儀容自檢":
                     if not photo:
                         error_msg = "❌ 必須上傳照片！"
                     else:
+                        # 1. 先檢查 EXIF (使用原始檔)
                         pass_exif, exif_msg = check_is_photo_today(photo)
                         if not pass_exif: error_msg = exif_msg
 
@@ -237,25 +255,30 @@ if st.session_state.current_page == "front_end":
                 if error_msg:
                     st.error(error_msg)
                 else:
-                    with st.spinner("資料上傳中 (含照片)..."):
+                    with st.spinner("影像壓縮與上傳中..."):
                         current_tw = get_tw_time()
                         time_str = current_tw.strftime("%Y-%m-%d %H:%M:%S")
                         date_str = current_tw.strftime("%Y-%m-%d")
                         
-                        # 上傳照片 (如有)
                         photo_link = "無"
                         if photo:
-                            file_name = f"{date_str}_{selected_store}_{emp_name}_{task_type}.jpg"
-                            photo_link = upload_to_drive(photo, file_name)
+                            try:
+                                # 2. 進行壓縮 (關鍵步驟)
+                                compressed_image = compress_image(photo)
+                                file_name = f"{date_str}_{selected_store}_{emp_name}_{task_type}.jpg"
+                                # 3. 上傳壓縮後的檔案
+                                photo_link = upload_to_drive(compressed_image, file_name)
+                            except Exception as e:
+                                st.error(f"圖片處理失敗，可能是記憶體不足或檔案毀損: {e}")
+                                st.stop()
                         
-                        # 準備寫入 Row
                         row = [
                             time_str, date_str, selected_store, emp_name, 
                             task_type, "✅ 已提交", photo_link, 0
                         ]
                         
                         save_data(row)
-                        st.success("✅ 提交成功！資料已同步至雲端。")
+                        st.success("✅ 提交成功！")
                         st.rerun()
 
 # B. 後台
@@ -277,7 +300,6 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
             st.rerun()
         st.stop()
 
-    # 登入後
     c1, c2 = st.columns([1, 5])
     if c1.button("🔙 返回前台"):
         st.session_state.current_page = "front_end"
@@ -293,16 +315,13 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
     
     with tab1:
         st.write("💡 資料來源：Google Sheets (即時同步)")
-        # 顯示 Dataframe (隱藏太長的照片連結)
         display_df = df_logs.copy()
         st.dataframe(display_df, use_container_width=True)
         
         st.divider()
         st.subheader("🔍 照片檢視")
         if not df_logs.empty:
-            # 建立選單
             options = df_logs.index.tolist()
-            # 讓選單顯示更清楚的資訊
             select_idx = st.selectbox(
                 "選擇紀錄", 
                 options, 
@@ -329,7 +348,6 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
         for store in STORE_LIST:
             store_logs = today_logs[today_logs["門市"] == store]
             completed = store_logs["任務項目"].unique().tolist()
-            # 檢查公用任務
             store_tasks = [t for t in REQUIRED_TASKS if t != "開店-儀容自檢"]
             missing = [t for t in store_tasks if t not in completed]
             
@@ -341,9 +359,8 @@ elif st.session_state.current_page in ["backend_login", "backend_main"]:
         st.dataframe(pd.DataFrame(report_status), use_container_width=True)
 
     with tab3:
-        st.subheader("📈 統計 (基於試算表數據)")
+        st.subheader("📈 統計")
         if not df_logs.empty:
-            # 簡單統計
             rank_df = df_logs.groupby("門市").size().reset_index(name="回報次數")
             st.bar_chart(rank_df, x="門市", y="回報次數")
         else:
