@@ -38,8 +38,8 @@ def get_data():
     """從 Google Sheet 讀取最新資料"""
     creds = init_connection()
     client = gspread.authorize(creds)
-    # 打開試算表 (請確保名稱正確)
-    sheet = client.open("馬尼通訊DB").sheet1
+    # 修改點 1: 更新檔名
+    sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
     
@@ -67,7 +67,7 @@ def upload_to_drive(file_obj, filename):
         fields='id, webViewLink'
     ).execute()
     
-    # 設定權限為「擁有連結者皆可讀取」(為了讓 Streamlit 能顯示圖片)
+    # 設定權限為「擁有連結者皆可讀取」
     permission = {'type': 'anyone', 'role': 'reader'}
     service.permissions().create(
         fileId=file.get('id'),
@@ -80,7 +80,8 @@ def save_data(row_data):
     """寫入一筆資料到 Google Sheet"""
     creds = init_connection()
     client = gspread.authorize(creds)
-    sheet = client.open("馬尼通訊DB").sheet1
+    # 修改點 2: 更新檔名
+    sheet = client.open("馬尼通訊即時回報系統_DB").sheet1
     sheet.append_row(row_data)
 
 def get_tw_time():
@@ -139,7 +140,7 @@ except Exception as e:
 # 側邊欄
 st.sidebar.title("馬尼通訊管理系統")
 with st.sidebar.expander("ℹ️ 系統資訊", expanded=False):
-    st.markdown("v2.0 (雲端連線版)")
+    st.markdown("v2.1 (檔名修正版)")
     if st.session_state.current_page == "front_end":
         if st.button("🔐 進入管理後台"):
             st.session_state.current_page = "backend_login"
